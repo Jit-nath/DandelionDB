@@ -1,7 +1,5 @@
-__pycache__/
 *.lion
 *.lion.wal
 *.lion.tmp
-.pytest_cache/
 target/
-*.pyd
+dist/

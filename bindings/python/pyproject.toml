@@ -1,0 +1,8 @@
+[project]
+name = "dandeliondb-python"
+version = "0.0.0"
+description = "Reserved location for a future DandelionDB Python binding"
+requires-python = ">=3.11"
+
+[tool.dandeliondb]
+status = "not-implemented"

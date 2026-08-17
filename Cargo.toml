@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/dandeliondb", "crates/dandeliondb-cli"]
+resolver = "3"
