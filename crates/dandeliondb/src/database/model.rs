@@ -63,6 +63,7 @@ pub struct SearchHit {
 pub struct StoredRecord {
     pub id: String,
     pub vector: Vec<f32>,
+    #[serde(alias = "data")]
     pub metadata: Map<String, Value>,
 }
 

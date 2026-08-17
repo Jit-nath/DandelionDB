@@ -70,8 +70,8 @@ enum Command {
         id: String,
         #[arg(long)]
         vector: String,
-        #[arg(long, alias = "data", default_value = "{}")]
-        metadata: String,
+        #[arg(long, alias = "metadata", default_value = "{}")]
+        data: String,
     },
     /// Add or replace records from a JSON array file.
     UpsertJson {
@@ -199,13 +199,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             collection,
             id,
             vector,
-            metadata,
+            data,
         } => {
             let mut database = open(&path, memory_budget, cli.threads)?;
             let record = StoredRecord {
                 id,
                 vector: parse_vector(&vector)?,
-                metadata: dandeliondb::metadata::parse_metadata(&metadata)?,
+                metadata: dandeliondb::metadata::parse_metadata(&data)?,
             };
             let count = database.upsert_many(&collection, vec![record])?;
             print_json(&serde_json::json!({"upserted": count}))?;

@@ -39,6 +39,13 @@ dandeliondb query documents.lion docs --vector "[1.0, 0.0, 0.0]" --top-k 5 --fil
 
 The command prints JSON so it can be used from shell scripts and other programs. Use `dandeliondb --help` or `dandeliondb <command> --help` to inspect the complete command surface.
 
+## Documentation
+
+- [Getting started](docs/getting-started.md)
+- [Typed tables and data](docs/tables.md)
+- [CLI reference](docs/cli-reference.md)
+- [Architecture and current boundaries](docs/architecture.md)
+
 Exact search is the default. Build and request the approximate index explicitly:
 
 ```powershell
