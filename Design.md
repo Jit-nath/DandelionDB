@@ -1,9 +1,15 @@
 ```py
 from dandeliondb import (
-    DandelionDB, Table, Col,
-    Index, IndexType,
+    DandelionDB,
+    Table,
+    Col,
+    Index,
+    IndexType,
     Transaction,
-    DandelionDBError, SchemaError, QueryError, IndexError
+    DandelionDBError,
+    SchemaError,
+    QueryError,
+    IndexError,
 )
 
 
@@ -11,19 +17,21 @@ from dandeliondb import (
 # SCHEMA DEFINITION
 # ═══════════════════════════════════════════════════════════════════
 
-class Embeddings(Table):
-    __version__ = 1                          # schema versioning
 
-    id       = Col("INTEGER", primary_key=True, auto_increment=True)
-    vector   = Col("VECTOR", dim=384, nullable=False)
+class Embeddings(Table):
+    __version__ = 1  # schema versioning
+
+    id = Col("INTEGER", primary_key=True, auto_increment=True)
+    vector = Col("VECTOR", dim=384, nullable=False)
     metadata = Col("TEXT", nullable=True)
-    score    = Col("FLOAT", default=0.0)
-    label    = Col("INTEGER", index=True)    # auto index on this col
+    score = Col("FLOAT", default=0.0)
+    label = Col("INTEGER", index=True)  # auto index on this col
+
 
 class Docs(Table):
     __version__ = 1
 
-    id      = Col("INTEGER", primary_key=True, auto_increment=True)
+    id = Col("INTEGER", primary_key=True, auto_increment=True)
     content = Col("TEXT", nullable=False)
 
 
@@ -36,8 +44,8 @@ db = DandelionDB.open("mydb.lion")
 db = DandelionDB.in_memory(tables=[Embeddings, Docs])
 
 # check what's inside an existing file
-db.tables()                                  # ["embeddings", "docs"]
-db.schema(Embeddings)                        # returns schema descriptor
+db.tables()  # ["embeddings", "docs"]
+db.schema(Embeddings)  # returns schema descriptor
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -45,10 +53,12 @@ db.schema(Embeddings)                        # returns schema descriptor
 # ═══════════════════════════════════════════════════════════════════
 
 db[Embeddings].insert(vector=[0.1, 0.2, ...], metadata="some text")
-db[Embeddings].insert_many([
-    {"vector": [...], "metadata": "..."},
-    {"vector": [...], "metadata": "..."},
-])
+db[Embeddings].insert_many(
+    [
+        {"vector": [...], "metadata": "..."},
+        {"vector": [...], "metadata": "..."},
+    ]
+)
 
 # upsert — insert or update if id exists
 db[Embeddings].upsert(id=1, vector=[0.1, ...], metadata="updated")
@@ -68,23 +78,23 @@ db[Embeddings].update_where(label=2, metadata="bulk update")  # update all match
 
 results = (
     db[Embeddings]
-      .search(vector=[0.1, 0.2, ...])
-      .metric("cosine")                      # cosine | euclidean | dot
-      .top_k(5)
-      .run()
+    .search(vector=[0.1, 0.2, ...])
+    .metric("cosine")  # cosine | euclidean | dot
+    .top_k(5)
+    .run()
 )
 
 # with filters
 results = (
     db[Embeddings]
-      .search(vector=[0.1, 0.2, ...])
-      .metric("cosine")
-      .filter(label=2)
-      .filter(score__gte=0.5)               # score >= 0.5
-      .filter(metadata__contains="text")
-      .top_k(10)
-      .offset(20)                            # pagination
-      .run()
+    .search(vector=[0.1, 0.2, ...])
+    .metric("cosine")
+    .filter(label=2)
+    .filter(score__gte=0.5)  # score >= 0.5
+    .filter(metadata__contains="text")
+    .top_k(10)
+    .offset(20)  # pagination
+    .run()
 )
 
 # result object
@@ -92,18 +102,18 @@ for row in results:
     row.id
     row.vector
     row.metadata
-    row.score                                # similarity score injected by search
-    row.rank                                 # 1-indexed rank
+    row.score  # similarity score injected by search
+    row.rank  # 1-indexed rank
 
 
 # ═══════════════════════════════════════════════════════════════════
 # EXACT LOOKUP / SCAN
 # ═══════════════════════════════════════════════════════════════════
 
-row   = db[Embeddings].get(id=1)
-rows  = db[Embeddings].all()
-rows  = db[Embeddings].filter(label=2).all()
-rows  = db[Embeddings].filter(score__gte=0.5).sort("score", desc=True).all()
+row = db[Embeddings].get(id=1)
+rows = db[Embeddings].all()
+rows = db[Embeddings].filter(label=2).all()
+rows = db[Embeddings].filter(score__gte=0.5).sort("score", desc=True).all()
 count = db[Embeddings].count()
 count = db[Embeddings].filter(label=2).count()
 exists = db[Embeddings].exists(id=1)
@@ -114,8 +124,8 @@ exists = db[Embeddings].exists(id=1)
 # ═══════════════════════════════════════════════════════════════════
 
 db[Embeddings].delete(id=1)
-db[Embeddings].delete_where(label=2)         # delete all matching
-db[Embeddings].clear()                       # wipe all rows, keep table
+db[Embeddings].delete_where(label=2)  # delete all matching
+db[Embeddings].clear()  # wipe all rows, keep table
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -124,12 +134,12 @@ db[Embeddings].clear()                       # wipe all rows, keep table
 
 db[Embeddings].create_index(
     col="vector",
-    type=IndexType.HNSW,                     # FLAT | HNSW | IVF
-    params={"ef_construction": 200, "M": 16}
+    type=IndexType.HNSW,  # FLAT | HNSW | IVF
+    params={"ef_construction": 200, "M": 16},
 )
 db[Embeddings].create_index(col="label", type=IndexType.BTREE)
 db[Embeddings].drop_index(col="vector")
-db[Embeddings].rebuild_index(col="vector")   # after bulk insert
+db[Embeddings].rebuild_index(col="vector")  # after bulk insert
 db[Embeddings].list_indexes()
 
 
@@ -138,7 +148,7 @@ db[Embeddings].list_indexes()
 # ═══════════════════════════════════════════════════════════════════
 
 # bump __version__ in your class, then:
-db.migrate(Embeddings)                       # diffs old vs new schema, applies changes
+db.migrate(Embeddings)  # diffs old vs new schema, applies changes
 
 # manual ops
 db[Embeddings].add_col(Col("source", "TEXT", default="unknown"))
@@ -161,12 +171,12 @@ with db.transaction() as tx:
 # DB LEVEL
 # ═══════════════════════════════════════════════════════════════════
 
-db.tables()                                  # list table names
-db.drop_table(Embeddings)                    # delete table + data
+db.tables()  # list table names
+db.drop_table(Embeddings)  # delete table + data
 db.rename_table(Embeddings, "embeddings_v2")
-db.stats()                                   # row counts, file size, index info
-db.vacuum()                                  # reclaim space after deletes
-db.export("backup.db")                       # copy to another file
+db.stats()  # row counts, file size, index info
+db.vacuum()  # reclaim space after deletes
+db.export("backup.db")  # copy to another file
 db.import_from("backup.db")
 
 
@@ -174,9 +184,9 @@ db.import_from("backup.db")
 # PERSISTENCE
 # ═══════════════════════════════════════════════════════════════════
 
-db.save()                                    # flush to disk
-db.close()                                   # save + release
-db.reload()                                  # re-read from disk
+db.save()  # flush to disk
+db.close()  # save + release
+db.reload()  # re-read from disk
 
 
 # ═══════════════════════════════════════════════════════════════════

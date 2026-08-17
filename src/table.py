@@ -39,7 +39,11 @@ class Col:
         return self.dtype is vector or self.dtype == "VECTOR"
 
     def to_schema(self) -> dict[str, Any]:
-        dtype = "VECTOR" if self.dtype is vector else getattr(self.dtype, "__name__", self.dtype)
+        dtype = (
+            "VECTOR"
+            if self.dtype is vector
+            else getattr(self.dtype, "__name__", self.dtype)
+        )
         return {
             "name": self.name,
             "dtype": dtype,
@@ -80,7 +84,9 @@ class TableSchema:
         self.name = table.table_name()
         self.class_name = table.__name__
         self.version = getattr(table, "__version__", 1)
-        self.columns = {name: column.to_schema() for name, column in table.__columns__.items()}
+        self.columns = {
+            name: column.to_schema() for name, column in table.__columns__.items()
+        }
 
     def to_dict(self) -> dict[str, Any]:
         return {

@@ -107,7 +107,11 @@ class DandelionDB:
         self._next_ids[new_name] = self._next_ids.pop(old_name)
 
     def stats(self) -> dict[str, Any]:
-        file_size = self.file_path.stat().st_size if self.file_path and self.file_path.exists() else 0
+        file_size = (
+            self.file_path.stat().st_size
+            if self.file_path and self.file_path.exists()
+            else 0
+        )
         return {
             "file_path": str(self.file_path) if self.file_path else None,
             "file_size": file_size,
@@ -122,7 +126,10 @@ class DandelionDB:
 
         payload = {
             "format": "dandeliondb-json-v1",
-            "tables": {name: table.schema().to_dict() for name, table in self._table_classes.items()},
+            "tables": {
+                name: table.schema().to_dict()
+                for name, table in self._table_classes.items()
+            },
             "next_ids": self._next_ids,
             "data": self._data,
         }
@@ -142,7 +149,9 @@ class DandelionDB:
         if payload.get("format") != "dandeliondb-json-v1":
             raise PathError(f"Unsupported database file: {self.file_path}")
         self._data = payload.get("data", {})
-        self._next_ids = {name: int(value) for name, value in payload.get("next_ids", {}).items()}
+        self._next_ids = {
+            name: int(value) for name, value in payload.get("next_ids", {}).items()
+        }
 
         for name in self._data:
             self._next_ids.setdefault(name, 1)
@@ -153,7 +162,9 @@ class DandelionDB:
     def export(self, path: str | Path) -> None:
         self.save()
         if self.file_path is None:
-            Path(path).write_text(json.dumps({"data": self._data}, indent=2), encoding="utf-8")
+            Path(path).write_text(
+                json.dumps({"data": self._data}, indent=2), encoding="utf-8"
+            )
             return
         shutil.copyfile(self.file_path, path)
 
@@ -200,7 +211,9 @@ class TableStore:
         if existing is None:
             return self.insert(**values)
 
-        existing.update(self._build_row({**existing, **values}, apply_auto_increment=False))
+        existing.update(
+            self._build_row({**existing, **values}, apply_auto_increment=False)
+        )
         self.db.save()
         return Row(**existing)
 
@@ -222,7 +235,9 @@ class TableStore:
         count = 0
         for row in self._rows:
             if _matches(row, filters, self.table):
-                row.update(self._build_row({**row, **updates}, apply_auto_increment=False))
+                row.update(
+                    self._build_row({**row, **updates}, apply_auto_increment=False)
+                )
                 count += 1
         self.db.save()
         return count
@@ -253,7 +268,9 @@ class TableStore:
 
     def delete_where(self, **filters: Any) -> int:
         before = len(self._rows)
-        self.db._data[self.name] = [row for row in self._rows if not _matches(row, filters, self.table)]
+        self.db._data[self.name] = [
+            row for row in self._rows if not _matches(row, filters, self.table)
+        ]
         deleted = before - len(self._rows)
         self.db.save()
         return deleted
@@ -264,7 +281,9 @@ class TableStore:
 
     def search(self, **vectors: Any) -> "SearchQuery":
         if len(vectors) != 1:
-            raise QueryError("search expects exactly one vector column, e.g. search(vector=[...])")
+            raise QueryError(
+                "search expects exactly one vector column, e.g. search(vector=[...])"
+            )
         column_name, query_vector = next(iter(vectors.items()))
         column = self.table.__columns__.get(column_name)
         if column is None or not column.is_vector:
@@ -272,7 +291,9 @@ class TableStore:
         _validate_vector(column_name, column, query_vector)
         return SearchQuery(self, column_name, query_vector)
 
-    def create_index(self, col: str, type: Any, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    def create_index(
+        self, col: str, type: Any, params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         self._require_column(col)
         return {"column": col, "type": type, "params": params or {}}
 
@@ -323,7 +344,9 @@ class TableStore:
                 return row
         return None
 
-    def _build_row(self, values: dict[str, Any], apply_auto_increment: bool = True) -> dict[str, Any]:
+    def _build_row(
+        self, values: dict[str, Any], apply_auto_increment: bool = True
+    ) -> dict[str, Any]:
         unknown = set(values) - set(self.table.__columns__)
         if unknown:
             raise SchemaError(f"Unknown column(s): {', '.join(sorted(unknown))}")
@@ -376,9 +399,15 @@ class Query:
         return self
 
     def all(self) -> list[Row]:
-        rows = [row for row in self.store._rows if _matches(row, self.filters, self.store.table)]
+        rows = [
+            row
+            for row in self.store._rows
+            if _matches(row, self.filters, self.store.table)
+        ]
         if self._sort_column:
-            rows.sort(key=lambda row: row.get(self._sort_column), reverse=self._sort_desc)
+            rows.sort(
+                key=lambda row: row.get(self._sort_column), reverse=self._sort_desc
+            )
         return [Row(**row) for row in rows]
 
     def count(self) -> int:
@@ -445,7 +474,11 @@ class Transaction:
         return self.db
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
-        if exc_type is not None and self._data is not None and self._next_ids is not None:
+        if (
+            exc_type is not None
+            and self._data is not None
+            and self._next_ids is not None
+        ):
             self.db._data = self._data
             self.db._next_ids = self._next_ids
             return False
@@ -481,7 +514,9 @@ def _validate_value(name: str, column: Col, value: Any) -> None:
 
 
 def _validate_vector(name: str, column: Col, value: Any) -> None:
-    if not isinstance(value, list) or not all(isinstance(item, int | float) for item in value):
+    if not isinstance(value, list) or not all(
+        isinstance(item, int | float) for item in value
+    ):
         raise SchemaError(f"{name} must be a list of numbers")
     if column.dim is not None and len(value) != column.dim:
         raise SchemaError(f"{name} must have {column.dim} dimensions")
@@ -529,7 +564,9 @@ def _score(query: list[float], candidate: list[float], metric: str) -> float:
     if metric == "dot":
         return sum(left * right for left, right in zip(query, candidate))
     if metric == "euclidean":
-        return math.sqrt(sum((left - right) ** 2 for left, right in zip(query, candidate)))
+        return math.sqrt(
+            sum((left - right) ** 2 for left, right in zip(query, candidate))
+        )
 
     dot = sum(left * right for left, right in zip(query, candidate))
     query_norm = math.sqrt(sum(value * value for value in query))
@@ -539,7 +576,9 @@ def _score(query: list[float], candidate: list[float], metric: str) -> float:
     return dot / (query_norm * candidate_norm)
 
 
-def _split_updates_and_filters(values: dict[str, Any], table: type[Table]) -> tuple[dict[str, Any], dict[str, Any]]:
+def _split_updates_and_filters(
+    values: dict[str, Any], table: type[Table]
+) -> tuple[dict[str, Any], dict[str, Any]]:
     filters: dict[str, Any] = {}
     updates: dict[str, Any] = {}
 

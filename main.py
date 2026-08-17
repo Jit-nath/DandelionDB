@@ -16,4 +16,3 @@ print(db.tables())
 
 for item in db.tables():
     print(db.schema(item))
-

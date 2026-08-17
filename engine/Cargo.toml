@@ -3,4 +3,23 @@ name = "dandeliondb-engine"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "_engine"
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
+pyo3 = { version = "0.23.5", features = ["extension-module"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_cbor = "0.11"
+serde_json = "1.0"
+crc32fast = "1.4"
+fs2 = "0.4"
+bytemuck = "1.21"
+memmap2 = "0.9"
+parking_lot = "0.12"
+rayon = "1.10"
+roaring = { version = "0.11", features = ["serde"] }
+thiserror = "2.0"
+
+[dev-dependencies]
+tempfile = "3.15"
