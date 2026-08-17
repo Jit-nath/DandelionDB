@@ -44,6 +44,7 @@ The command prints JSON so it can be used from shell scripts and other programs.
 - [Getting started](docs/getting-started.md)
 - [Typed tables and data](docs/tables.md)
 - [CLI reference](docs/cli-reference.md)
+- [Embed the Rust library](docs/rust-library.md)
 - [Architecture and current boundaries](docs/architecture.md)
 
 Exact search is the default. Build and request the approximate index explicitly:
