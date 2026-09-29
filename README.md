@@ -6,7 +6,13 @@ The project is designed as a focused foundation for applications that need metad
 
 ## Why DandelionDB
 
-Many applications keep structured metadata in one system and embeddings in another. DandelionDB explores a simpler embedded architecture in which a record's identifiers, text, timestamps, attributes, and embedding can be defined together and queried through one API.
+AI systems are becoming smaller, more capable, and increasingly practical to run on local hardware. As models move closer to the user, however, the context they need does not disappear—it grows. Applications need to retrieve more relevant documents, memories, metadata, and embeddings before a model can produce a useful response.
+
+This creates an important systems problem. Running an AI model locally is becoming more accessible, but the databases around those models are not always designed for the constraints of local devices. A local assistant, edge application, or private knowledge tool may have limited memory, storage bandwidth, CPU capacity, and power. Carrying the operational cost of a large, general-purpose database into that environment can undermine the advantages of local inference.
+
+DandelionDB began as an exploration of a focused alternative: a vector-aware embedded database designed with local execution in mind. The goal is to provide a small, durable foundation for storing structured records and embeddings together, with a Rust backend that can make efficient use of available hardware and a minimal query language that exposes the operations an application actually needs.
+
+The project is intentionally narrow in scope. It does not try to reproduce every feature of a traditional server database. Instead, it focuses on the path between local data and local intelligence: define a schema, store context, filter it, and retrieve the most relevant vectors without introducing a separate service or a large operational footprint.
 
 The current design emphasizes:
 
@@ -15,7 +21,9 @@ The current design emphasizes:
 - A readable query language for collection management, writes, filters, and vector search.
 - A durable `.lion` database file that can be closed and reopened.
 - Deterministic validation at tokenization, parsing, schema, and execution boundaries.
-- A foundation for future approximate-nearest-neighbor index implementations.
+- A foundation for memory-conscious approximate-nearest-neighbor index implementations.
+
+The broader vision is a practical local data layer for AI applications: compact enough to run alongside a model, structured enough to be dependable, and transparent enough that its storage and query behavior can be understood and improved over time.
 
 ## Current capabilities
 
