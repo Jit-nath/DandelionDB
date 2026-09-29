@@ -1,5 +1,2 @@
+/target
 *.lion
-*.lion.wal
-*.lion.tmp
-target/
-dist/
