@@ -117,6 +117,67 @@ The code is organized into focused modules:
 - `src/types/` — scalar and vector type definitions.
 - `src/index/` — the planned home for index implementations.
 
+## Positioning, alternatives, and trade-offs
+
+DandelionDB is not intended to replace every database. Its intended position is narrower: an embedded, Rust-native data layer for local AI applications that need structured records and vector retrieval in one small operational unit.
+
+The comparison below focuses on the alternatives an engineering team would most likely evaluate. It is a product-positioning comparison, not a benchmark. DandelionDB does not yet have the maturity, ecosystem, or performance evidence to claim superiority over established systems.
+
+### Single-file and embedded databases
+
+Single-file storage is not by itself a new differentiator. [SQLite](https://www.sqlite.org/) is the reference point for mature serverless, transactional, single-file databases, and [DuckDB](https://duckdb.org/) is a strong reference point for embedded analytical workloads. DandelionDB uses the same broad deployment principle—run inside the application and persist to a local file—but focuses the data model and query surface on local retrieval with embeddings.
+
+| Database or category | Where it is stronger | What DandelionDB does differently | DandelionDB trade-off |
+| --- | --- | --- | --- |
+| [SQLite](https://www.sqlite.org/) | Mature ACID transactions, broad SQL support, excellent tooling, stable file format, and an exceptionally large ecosystem. | Treats vectors as a first-class schema type and makes vector similarity search part of the core query model instead of requiring a separate extension or service. | Far less mature. It does not currently offer SQLite's transaction guarantees, SQL breadth, compatibility, tooling, or proven production history. |
+| [DuckDB](https://duckdb.org/) | In-process analytical SQL, columnar execution, aggregations, and data-science workflows. | Targets operational local context retrieval: typed records, metadata filters, and vector search with a deliberately smaller language. | It is not an analytical database and should not be selected for complex OLAP, large scans, or SQL compatibility. |
+| [LanceDB](https://lancedb.com/) | Embedded vector search, a data-science-friendly ecosystem, and a vector-native storage model. | Keeps a compact Rust engine and a minimal DQL surface focused on the essential path from schema to filtered retrieval. | LanceDB currently offers a broader vector-data product surface and ecosystem; DandelionDB is earlier and has fewer integrations and index implementations. |
+| Embedded key-value engines such as [LMDB](https://www.symas.com/lmdb) | Very small, predictable primitives and strong performance for key-value access. | Provides schemas, typed values, filters, row operations, and vector similarity semantics rather than making the application build those layers itself. | A key-value engine may be a better choice when the application needs only point reads/writes, mature concurrency behavior, or maximum simplicity at the storage primitive level. |
+| Local document stores | Flexible document modeling and often convenient application-level APIs. | Uses explicit schemas and fixed-dimension vectors so malformed records and incompatible query vectors can be rejected early. | Less flexible for rapidly changing, deeply nested, or schemaless application data. |
+
+### Vector databases and vector search systems
+
+| Database or category | Where it is stronger | What DandelionDB does differently | DandelionDB trade-off |
+| --- | --- | --- | --- |
+| [Qdrant](https://qdrant.tech/) | Purpose-built vector search, payload filtering, mature ANN capabilities, and production deployment options. Qdrant also provides an embedded Edge direction for constrained environments. | Aims to combine the vector and relational-looking record model in one small Rust-native file and process, with no separate vector service in the basic deployment. | Qdrant has substantially more mature indexing, filtering, operations, clients, and performance work. DandelionDB's current search path is an exact scan and should not be expected to match Qdrant at scale. |
+| [Milvus](https://milvus.io/) | Large-scale distributed vector search, multiple index families, and a broad production-oriented architecture. | Optimizes for a local embedded use case rather than a distributed service topology. | It gives up horizontal scale, service isolation, cluster operations, mature ANN indexing, and production tooling. |
+| [Weaviate](https://weaviate.io/) | A full vector database platform with schema management, APIs, hybrid search, modules, and cloud options. | Keeps the core intentionally local, dependency-light, and accessible through a small embedded API. | It lacks Weaviate's APIs, modules, hybrid search surface, multi-user service model, and operational ecosystem. |
+| [Chroma](https://www.trychroma.com/) | A developer-friendly AI retrieval workflow with local and hosted options and a large Python-oriented community. | Prioritizes a Rust implementation, an explicit typed schema, and a durable single-file engine as the core product boundary. | Chroma is currently easier to adopt for many Python AI prototypes and has a broader surrounding application ecosystem. |
+| [pgvector](https://github.com/pgvector/pgvector) on [PostgreSQL](https://www.postgresql.org/) | PostgreSQL transactions, joins, constraints, mature operational tooling, and vector indexes such as HNSW and IVFFlat through an extension. | Removes the requirement to operate PostgreSQL when the application needs a local, focused store for records and embeddings. | It gives up PostgreSQL's relational power, transaction model, extensions, client libraries, administration tools, and production maturity. |
+| [Elasticsearch](https://www.elastic.co/elasticsearch) or [OpenSearch](https://opensearch.org/) | Full-text search, distributed indexing, observability/search operations, hybrid retrieval, and mature service deployments. | Avoids a search cluster when the workload is local and primarily needs structured context plus vector similarity. | It does not provide comparable text-analysis, distributed search, operational, or hybrid-ranking capabilities. |
+| [Redis](https://redis.io/) with vector search | Very fast in-memory operations, rich data structures, and service-oriented deployment patterns. | Makes persistence and the local file the primary boundary rather than an always-running memory-oriented service. | It lacks Redis's mature server model, ecosystem, replication options, and broad in-memory data-structure support. |
+| Managed vector services such as [Pinecone](https://www.pinecone.io/) | Managed scaling, availability, operations, hosted APIs, and production support. | Keeps data on the local device and avoids network dependency, hosted-service cost, and sending private context to an external service. | It gives up managed availability, elastic scaling, remote access, multi-tenant operations, and hosted support. |
+
+### The practical difference
+
+The intended distinction is not “DandelionDB has more features.” Established databases win on maturity, breadth, ecosystem, operational guarantees, and scale. DandelionDB instead explores a different optimization target:
+
+1. Keep the deployment local and embedded.
+2. Keep structured metadata and embeddings in the same durable file.
+3. Keep the query language small enough to understand and implement on constrained devices.
+4. Keep the backend close to the hardware through Rust rather than introducing a separate database service.
+5. Leave room for purpose-built vector indexes without requiring them for the first usable storage and retrieval path.
+
+### Strengths DandelionDB is designed to offer
+
+- **Low operational overhead:** no database server, cluster, network connection, or separate vector service is required for the basic embedded workflow.
+- **Local-first data handling:** context can remain on the device, which is useful for privacy-sensitive assistants, offline systems, and edge applications.
+- **One data model for context:** identifiers, metadata, text, timestamps, and embeddings can be defined and persisted together.
+- **A constrained surface area:** the DQL grammar and Rust modules are intentionally small enough to audit, extend, and adapt.
+- **Transparent implementation:** the catalog, parser, execution path, and file format live in the repository rather than being hidden behind a remote service.
+
+### Trade-offs and honest limitations
+
+- **Maturity:** DandelionDB is an early-stage project, while SQLite, PostgreSQL, DuckDB, and established vector systems have years of production use and testing behind them.
+- **Performance evidence:** there are no published benchmarks yet. In particular, the current vector search implementation uses an exact scan; the low-memory and hardware-efficiency goals still need measurement on representative devices.
+- **Memory model:** active rows are currently reconstructed into in-memory state when a database is opened. The long-term low-memory goal therefore requires additional storage and indexing work.
+- **Durability guarantees:** the project has durable file writes and recovery logic, but it does not yet expose a documented transaction or isolation model comparable to mature relational databases.
+- **Concurrency:** the current API is designed around a single embedded process and does not yet provide a documented multi-writer or multi-process coordination model.
+- **Indexing:** `flat` index metadata is supported, but HNSW and IVF acceleration are not currently integrated into query execution.
+- **Ecosystem:** there are no mature client libraries, migrations, admin tools, observability integrations, hosted deployment, replication, or compatibility guarantees yet.
+
+For a local AI prototype or a system where simplicity, privacy, and a single-file deployment matter most, DandelionDB is an interesting foundation to evaluate. For transactional business systems, high-concurrency services, large-scale vector retrieval, or mission-critical production workloads, a mature alternative may currently be the more responsible choice.
+
 ## Quick start
 
 ### Requirements
