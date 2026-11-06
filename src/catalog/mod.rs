@@ -1,3 +1,5 @@
+#![allow(clippy::module_inception)]
+
 pub mod catalog;
 pub mod collection;
 pub mod schema;

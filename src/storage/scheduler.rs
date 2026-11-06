@@ -14,7 +14,6 @@ pub const DEFAULT_RECORD_FORECAST: u64 = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReservationKind {
-    Schema,
     Table,
     Vector,
 }
@@ -46,10 +45,6 @@ impl StorageScheduler {
         }
     }
 
-    pub fn record_forecast(&self) -> u64 {
-        self.record_forecast
-    }
-
     /// Returns a sequence of 1, 2, 4, ... 256 MiB reservations large enough
     /// for `required_bytes`.  Requests above 256 MiB are split into max-sized
     /// extents instead of exceeding the file-format limit.
@@ -62,17 +57,6 @@ impl StorageScheduler {
             remaining = remaining.saturating_sub(size);
         }
         result
-    }
-
-    pub fn plan_schema(&self, encoded_schema_bytes: u64) -> Vec<Reservation> {
-        self.binary_reservations(encoded_schema_bytes)
-            .into_iter()
-            .map(|bytes| Reservation {
-                kind: ReservationKind::Schema,
-                column_number: 0,
-                bytes,
-            })
-            .collect()
     }
 
     /// Reserves one row-store area plus one dedicated area for every vector
@@ -109,6 +93,35 @@ impl StorageScheduler {
             }
         }
         reservations
+    }
+
+    /// Returns the standard size for a new extent belonging to a collection
+    /// data stream. Rollover uses the same plan as initial allocation so the
+    /// storage layer can grow without callers managing physical segments.
+    pub fn extension_bytes(
+        &self,
+        schema: &Schema,
+        kind: ReservationKind,
+        column_number: u8,
+        used_bytes: u64,
+        allocated_bytes: u64,
+    ) -> Option<u64> {
+        let baseline = self
+            .plan_collection(schema)
+            .into_iter()
+            .find(|reservation| {
+                reservation.kind == kind && reservation.column_number == column_number
+            })
+            .map(|reservation| reservation.bytes)?;
+        // Double the observed stream target on rollover. This gives hot
+        // tables progressively larger extents while cold streams retain the
+        // conservative initial reservation.
+        let target = used_bytes
+            .max(allocated_bytes)
+            .max(baseline)
+            .saturating_mul(2);
+        let required = target.max(baseline);
+        self.binary_reservations(required).into_iter().next()
     }
 }
 
@@ -161,6 +174,27 @@ mod tests {
         assert_eq!(
             scheduler.binary_reservations(300 * MIB),
             vec![256 * MIB, 64 * MIB]
+        );
+    }
+
+    #[test]
+    fn grows_extensions_from_observed_stream_usage() {
+        let scheduler = StorageScheduler::default();
+        let schema = Schema::new(vec![crate::catalog::Field {
+            column_number: 0,
+            name: "body".into(),
+            data_type: DataType::Scalar(ScalarType::Text),
+            nullable: false,
+            primary_key: false,
+            auto_increment: false,
+        }]);
+        assert_eq!(
+            scheduler.extension_bytes(&schema, ReservationKind::Table, 0, MIB, MIB),
+            Some(2 * MIB)
+        );
+        assert_eq!(
+            scheduler.extension_bytes(&schema, ReservationKind::Table, 0, 3 * MIB, 3 * MIB),
+            Some(8 * MIB)
         );
     }
 }

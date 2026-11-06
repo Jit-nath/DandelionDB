@@ -235,6 +235,12 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                     "from" => tokens.push(Token::From),
 
                     "find" => tokens.push(Token::Find),
+                    "get" => tokens.push(Token::Get),
+                    "check" => tokens.push(Token::Check),
+                    "stats" => tokens.push(Token::Stats),
+                    "show" => tokens.push(Token::Show),
+                    "segments" => tokens.push(Token::Segments),
+                    "database" => tokens.push(Token::Database),
                     "top" => tokens.push(Token::Top),
                     "within" => tokens.push(Token::Within),
                     "near" => tokens.push(Token::Near),

@@ -10,9 +10,4 @@ codegen-units = 1
 panic = "abort"
 strip = "symbols"
 
-#[lib]
-#name="dandeliondb"
-#version = "0.1.0"
-#crate-type = ["cdylib"]
-
 [dependencies]

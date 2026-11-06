@@ -11,6 +11,12 @@ pub enum Statement {
     Delete(Delete),
 
     Find(Find),
+    Get(Get),
+    CheckCollection(CheckCollection),
+    CheckDatabase,
+    StatsCollection(StatsCollection),
+    StatsDatabase,
+    ShowSegments(ShowSegments),
 }
 
 // =========================
@@ -66,10 +72,10 @@ pub struct DropIndex {
 #[derive(Debug)]
 pub struct Insert {
     pub(crate) collection: String,
-    pub(crate) values: Vec<FieldValue>,
+    pub(crate) rows: Vec<Vec<FieldValue>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FieldValue {
     pub(crate) field: String,
     pub(crate) value: Value,
@@ -110,6 +116,28 @@ pub struct Find {
     pub(crate) filter: Option<FilterExpr>,
     pub(crate) search: Option<SearchClause>,
     pub(crate) return_fields: Vec<ReturnField>,
+}
+
+#[derive(Debug)]
+pub struct Get {
+    pub(crate) collection: String,
+    pub(crate) filter: Option<FilterExpr>,
+    pub(crate) return_fields: Vec<ReturnField>,
+}
+
+#[derive(Debug)]
+pub struct CheckCollection {
+    pub(crate) collection: String,
+}
+
+#[derive(Debug)]
+pub struct StatsCollection {
+    pub(crate) collection: String,
+}
+
+#[derive(Debug)]
+pub struct ShowSegments {
+    pub(crate) collection: Option<String>,
 }
 
 #[derive(Debug)]

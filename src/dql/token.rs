@@ -20,6 +20,12 @@ pub enum Token {
     From,
 
     Find,
+    Get,
+    Check,
+    Stats,
+    Show,
+    Segments,
+    Database,
     Top,
     Within,
     Near,
@@ -31,25 +37,6 @@ pub enum Token {
     // Logical operators
     And,
     Or,
-
-    // Column properties
-    Primary,
-    AutoIncrement,
-    Nullable,
-
-    // Index types
-    Flat,
-    Hnsw,
-    Ivf,
-
-    // Search properties
-    Ef,
-    Nprobe,
-
-    // Vector metrics
-    Cosine,
-    DotProduct,
-    Euclidean,
 
     // Literals / values
     Identifier(String),

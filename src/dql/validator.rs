@@ -10,6 +10,14 @@ pub fn validate(statement: &Statement) -> Result<(), String> {
         Statement::Update(stmt) => validate_update(stmt),
         Statement::Delete(stmt) => validate_delete(stmt),
         Statement::Find(stmt) => validate_find(stmt),
+        Statement::Get(stmt) => validate_get(stmt),
+        Statement::CheckCollection(stmt) => validate_named_collection(&stmt.collection),
+        Statement::CheckDatabase | Statement::StatsDatabase => Ok(()),
+        Statement::StatsCollection(stmt) => validate_named_collection(&stmt.collection),
+        Statement::ShowSegments(stmt) => stmt
+            .collection
+            .as_ref()
+            .map_or(Ok(()), |name| validate_named_collection(name)),
     }
 }
 
@@ -286,13 +294,19 @@ fn validate_insert(stmt: &Insert) -> Result<(), String> {
         return Err("Collection name cannot be empty".to_string());
     }
 
-    if stmt.values.is_empty() {
-        return Err("Insert must contain at least one value".to_string());
+    if stmt.rows.is_empty() {
+        return Err("Insert must contain at least one row".to_string());
     }
 
-    for value in &stmt.values {
-        if value.field.is_empty() {
-            return Err("Field name cannot be empty".to_string());
+    for row in &stmt.rows {
+        if row.is_empty() {
+            return Err("Insert row cannot be empty".to_string());
+        }
+        for value in row {
+            if value.field.is_empty() {
+                return Err("Field name cannot be empty".to_string());
+            }
+            validate_value(&value.value)?;
         }
     }
 
@@ -375,6 +389,31 @@ fn validate_find(stmt: &Find) -> Result<(), String> {
         VectorExpr::Variable(_) => {}
     }
 
+    Ok(())
+}
+
+fn validate_get(stmt: &Get) -> Result<(), String> {
+    validate_named_collection(&stmt.collection)?;
+    if stmt.return_fields.is_empty() {
+        return Err("GET must return at least one field".to_string());
+    }
+    if stmt
+        .return_fields
+        .iter()
+        .any(|field| matches!(field, ReturnField::Score))
+    {
+        return Err("GET does not support _score".to_string());
+    }
+    if let Some(filter) = &stmt.filter {
+        validate_filter(filter)?;
+    }
+    Ok(())
+}
+
+fn validate_named_collection(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Collection name cannot be empty".to_string());
+    }
     Ok(())
 }
 

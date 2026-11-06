@@ -1,21 +1,22 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::catalog::{Catalog, Collection, Field, Schema};
 use crate::dql::parser::Parser;
 use crate::dql::tokenizer::tokenize;
 use crate::dql::validator::validate;
+use crate::index::VectorIndex;
 
 use crate::storage::header::{HEADER_VERSION_MAJOR, HEADER_VERSION_MINOR, Header};
 use crate::storage::helpers::validate_create_path;
 use crate::storage::mutation::DataMutationProcess;
-use crate::storage::reader::SegmentReader;
+use crate::storage::reader::{LogicalRecord, SegmentReader};
 use crate::storage::scheduler::{ReservationKind, StorageScheduler};
 use crate::storage::segment_index::{SegmentIndex, SegmentIndexEntry};
 
-use crate::dql::ast::Value;
+use crate::dql::ast::{FieldValue, Value};
 use crate::errors::DatabaseError;
 use crate::execution::execute::execute_statement;
 use crate::types::{DataType, DistanceMetric, ScalarType, VectorElementType, VectorType};
@@ -23,9 +24,15 @@ use crate::types::{DataType, DistanceMetric, ScalarType, VectorElementType, Vect
 const SCHEMA_SEGMENT_MAGIC: &[u8; 8] = b"DNSCH001";
 const SCHEMA_SEGMENT_HEADER_SIZE: u64 = 16;
 const SCHEMA_SEGMENT_CAPACITY: u64 = 1024 * 1024;
-const SCHEMA_DATA_TYPE: u8 = 0x00;
-const TABLE_DATA_TYPE: u8 = 0x01;
-const VECTOR_DATA_TYPE: u8 = 0x02;
+pub(crate) const SCHEMA_DATA_TYPE: u8 = 0x00;
+pub(crate) const TABLE_DATA_TYPE: u8 = 0x01;
+pub(crate) const VECTOR_DATA_TYPE: u8 = 0x02;
+const SEGMENT_RECORD_HEADER_SIZE: u64 = 12;
+const SEGMENT_HEADER_SIZE: u64 = 16;
+const SEGMENT_TABLE_UPSERT: u8 = 0x21;
+const SEGMENT_VECTOR_UPSERT: u8 = 0x22;
+const SEGMENT_TOMBSTONE: u8 = 0x23;
+const SEGMENT_MAGIC: &[u8; 8] = b"DNSEG001";
 
 #[derive(Debug, Clone)]
 pub(crate) struct StoredRow {
@@ -34,19 +41,66 @@ pub(crate) struct StoredRow {
     pub deleted: bool,
 }
 
+/// A typed row used by [`Database::insert_many`].
+#[derive(Debug, Clone, Default)]
+pub struct InsertRow {
+    pub(crate) values: Vec<FieldValue>,
+}
+
+impl InsertRow {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn value(mut self, field: impl Into<String>, value: Value) -> Self {
+        self.values.push(FieldValue {
+            field: field.into(),
+            value,
+        });
+        self
+    }
+
+    pub fn text(self, field: impl Into<String>, value: impl Into<String>) -> Self {
+        self.value(field, Value::String(value.into()))
+    }
+
+    pub fn number(self, field: impl Into<String>, value: impl ToString) -> Self {
+        self.value(field, Value::Number(value.to_string()))
+    }
+
+    pub fn boolean(self, field: impl Into<String>, value: bool) -> Self {
+        self.value(field, Value::Boolean(value))
+    }
+
+    pub fn null(self, field: impl Into<String>) -> Self {
+        self.value(field, Value::Null)
+    }
+
+    pub fn vector<I, T>(self, field: impl Into<String>, values: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: ToString,
+    {
+        self.value(
+            field,
+            Value::Vector(values.into_iter().map(|value| value.to_string()).collect()),
+        )
+    }
+}
+
 #[derive(Debug)]
 pub struct Database {
     file: File,
     path: PathBuf,
 
     pub(crate) catalog: Catalog,
-    pub header: Header,
-    pub segment_index: SegmentIndex,
+    segment_index: SegmentIndex,
     segment_reader: SegmentReader,
     mutations: DataMutationProcess,
     pub(crate) rows: HashMap<String, Vec<StoredRow>>,
-    pub(crate) indexes: HashSet<(String, String)>,
+    pub(crate) indexes: HashMap<(String, String), VectorIndex>,
     pub(crate) next_row_id: u64,
+    next_transaction_id: u64,
 }
 
 impl Database {
@@ -81,14 +135,14 @@ impl Database {
         Ok(Self {
             file,
             path: path.to_path_buf(),
-            header,
             segment_index,
             segment_reader,
             mutations: DataMutationProcess::default(),
             catalog: Catalog::new(),
             rows: HashMap::new(),
-            indexes: HashSet::new(),
+            indexes: HashMap::new(),
             next_row_id: 1,
+            next_transaction_id: 1,
         })
     }
 
@@ -129,17 +183,18 @@ impl Database {
         let mut database = Self {
             file,
             path: path.to_path_buf(),
-            header,
             segment_index,
             segment_reader,
             mutations: DataMutationProcess::default(),
             catalog: Catalog::new(),
             rows: HashMap::new(),
-            indexes: HashSet::new(),
+            indexes: HashMap::new(),
             next_row_id: 1,
+            next_transaction_id: 1,
         };
         database.load_catalog()?;
         database.load_data_log()?;
+        database.rebuild_vector_indexes()?;
         Ok(database)
     }
 
@@ -158,6 +213,96 @@ impl Database {
         validate(&ast).map_err(|err| DatabaseError::Validation(err.to_string()))?;
 
         execute_statement(self, &ast)
+    }
+
+    pub fn insert_many<I>(
+        &mut self,
+        collection: impl AsRef<str>,
+        rows: I,
+    ) -> Result<crate::result::QueryResult, DatabaseError>
+    where
+        I: IntoIterator<Item = InsertRow>,
+    {
+        let rows = rows.into_iter().map(|row| row.values).collect::<Vec<_>>();
+        crate::execution::execute::insert_rows(self, collection.as_ref(), &rows)
+    }
+
+    pub(crate) fn rebuild_vector_indexes(&mut self) -> Result<(), DatabaseError> {
+        let definitions = self
+            .indexes
+            .iter()
+            .map(|((collection, field), index)| {
+                let (m, ef_construction, nlist) = index.parameters();
+                (
+                    collection.clone(),
+                    field.clone(),
+                    index.kind().to_string(),
+                    m,
+                    ef_construction,
+                    nlist,
+                )
+            })
+            .collect::<Vec<_>>();
+        for (collection, field, kind, m, ef_construction, nlist) in definitions {
+            self.rebuild_vector_index_with_params(
+                &collection,
+                &field,
+                &kind,
+                m,
+                ef_construction,
+                nlist,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn rebuild_vector_index_with_params(
+        &mut self,
+        collection: &str,
+        field: &str,
+        kind: &str,
+        m: usize,
+        ef_construction: usize,
+        nlist: usize,
+    ) -> Result<(), DatabaseError> {
+        let vector_type = match &self
+            .catalog
+            .get_collection(collection)
+            .map_err(|error| DatabaseError::Catalog(format!("{error:?}")))?
+            .schema()
+            .get_field(field)
+            .ok_or_else(|| DatabaseError::Validation(format!("Unknown field '{field}'")))?
+            .data_type
+        {
+            DataType::Vector(vector) => *vector,
+            _ => {
+                return Err(DatabaseError::Validation(
+                    "Index field must be a vector".into(),
+                ));
+            }
+        };
+        let points = self
+            .rows(collection)
+            .iter()
+            .filter(|row| !row.deleted)
+            .filter_map(|row| match row.values.get(field) {
+                Some(Value::Vector(values)) => Some((
+                    row.id,
+                    values
+                        .iter()
+                        .filter_map(|value| value.parse().ok())
+                        .collect(),
+                )),
+                _ => None,
+            })
+            .filter(|(_, values): &(u64, Vec<f64>)| values.len() == vector_type.dimension as usize)
+            .collect::<Vec<_>>();
+        let index =
+            VectorIndex::build(kind, &points, vector_type.metric, m, ef_construction, nlist)
+                .map_err(DatabaseError::Validation)?;
+        self.indexes
+            .insert((collection.into(), field.into()), index);
+        Ok(())
     }
 
     pub fn close(self) -> Result<(), DatabaseError> {
@@ -198,6 +343,50 @@ impl Database {
         self.mutations.live_ids(collection)
     }
 
+    pub(crate) fn segment_entries(&self) -> &[SegmentIndexEntry] {
+        self.segment_reader.entries()
+    }
+
+    pub(crate) fn read_data_records_for_check(&mut self) -> Result<Vec<Vec<u8>>, DatabaseError> {
+        self.segment_reader
+            .read_data_records(&mut self.file, &self.segment_index)
+            .map_err(|_| DatabaseError::InvalidDatabase)
+    }
+
+    pub(crate) fn segment_used_bytes(
+        &mut self,
+        entry: SegmentIndexEntry,
+    ) -> Result<Option<u64>, DatabaseError> {
+        if entry.data_type() == SCHEMA_DATA_TYPE {
+            return Ok(Some(self.read_schema_used(entry.offset)?));
+        }
+        let mut magic = [0u8; 8];
+        self.file.seek(SeekFrom::Start(entry.offset))?;
+        self.file.read_exact(&mut magic)?;
+        if &magic != SEGMENT_MAGIC {
+            return Ok(None);
+        }
+        let mut used = [0u8; 8];
+        self.file.read_exact(&mut used)?;
+        let used = u64::from_le_bytes(used);
+        if !(SEGMENT_HEADER_SIZE..=entry.total_size).contains(&used) {
+            return Err(DatabaseError::InvalidDatabase);
+        }
+        Ok(Some(used))
+    }
+
+    pub(crate) fn file_size(&self) -> Result<u64, DatabaseError> {
+        Ok(self.file.metadata()?.len())
+    }
+
+    pub(crate) fn segment_index_size(&self) -> u64 {
+        self.segment_index.size()
+    }
+
+    pub(crate) fn next_transaction_id(&self) -> u64 {
+        self.next_transaction_id
+    }
+
     pub(crate) fn forget_live_records(&mut self, collection: &str) {
         self.mutations.forget_collection(collection);
     }
@@ -207,17 +396,16 @@ impl Database {
         Ok(())
     }
 
-    pub(crate) fn append_row_insert(
+    pub(crate) fn append_row_insert_batch(
         &mut self,
         collection: &str,
-        row: &StoredRow,
+        rows: &[StoredRow],
     ) -> Result<(), DatabaseError> {
-        let mut payload = vec![1u8];
-        encode_string(&mut payload, collection)?;
-        payload.extend_from_slice(&row.id.to_le_bytes());
-        encode_values(&mut payload, &row.values)?;
-        self.append_data_record(&payload)?;
-        self.mutations.record_insert(collection, row.id);
+        self.append_segment_transaction(collection, rows, &[])?;
+
+        for row in rows {
+            self.mutations.record_insert(collection, row.id);
+        }
         Ok(())
     }
 
@@ -226,11 +414,7 @@ impl Database {
         collection: &str,
         row: &StoredRow,
     ) -> Result<(), DatabaseError> {
-        let mut payload = vec![2u8];
-        encode_string(&mut payload, collection)?;
-        payload.extend_from_slice(&row.id.to_le_bytes());
-        encode_values(&mut payload, &row.values)?;
-        self.append_data_record(&payload)
+        self.append_segment_transaction(collection, std::slice::from_ref(row), &[])
     }
 
     pub(crate) fn append_row_delete(
@@ -238,23 +422,262 @@ impl Database {
         collection: &str,
         id: u64,
     ) -> Result<(), DatabaseError> {
-        let mut payload = vec![3u8];
-        encode_string(&mut payload, collection)?;
-        payload.extend_from_slice(&id.to_le_bytes());
-        self.append_data_record(&payload)?;
+        self.append_segment_transaction(collection, &[], &[id])?;
         self.mutations.record_delete(collection, id);
         Ok(())
     }
 
+    fn append_segment_transaction(
+        &mut self,
+        collection: &str,
+        rows: &[StoredRow],
+        deleted_ids: &[u64],
+    ) -> Result<(), DatabaseError> {
+        let original_length = self.file.metadata()?.len();
+        let transaction_id = self.next_transaction_id;
+        self.next_transaction_id = transaction_id
+            .checked_add(1)
+            .ok_or_else(|| DatabaseError::Validation("Transaction ID space exhausted".into()))?;
+        let table_number = self
+            .catalog
+            .get_collection(collection)
+            .map_err(|error| DatabaseError::Catalog(format!("{error:?}")))?
+            .table_number();
+        let schema = self
+            .catalog
+            .get_collection(collection)
+            .map_err(|error| DatabaseError::Catalog(format!("{error:?}")))?
+            .schema()
+            .clone();
+        let mut changed_segments = Vec::new();
+
+        let result = (|| {
+            self.append_transaction_marker(7, transaction_id)?;
+            for row in rows {
+                let mut scalar_values = row.values.clone();
+                for field in schema.fields() {
+                    if matches!(field.data_type, DataType::Vector(_)) {
+                        scalar_values.remove(&field.name);
+                    }
+                }
+                let mut table_payload = vec![SEGMENT_TABLE_UPSERT];
+                table_payload.extend_from_slice(&transaction_id.to_le_bytes());
+                table_payload.extend_from_slice(&table_number.to_le_bytes());
+                table_payload.extend_from_slice(&row.id.to_le_bytes());
+                encode_values(&mut table_payload, &scalar_values)?;
+                changed_segments.push(self.append_segment_record(
+                    TABLE_DATA_TYPE,
+                    table_number,
+                    0,
+                    &table_payload,
+                )?);
+
+                for field in schema.fields() {
+                    if !matches!(field.data_type, DataType::Vector(_)) {
+                        continue;
+                    }
+                    let Some(value) = row.values.get(&field.name) else {
+                        continue;
+                    };
+                    let mut vector_payload = vec![SEGMENT_VECTOR_UPSERT];
+                    vector_payload.extend_from_slice(&transaction_id.to_le_bytes());
+                    vector_payload.extend_from_slice(&table_number.to_le_bytes());
+                    vector_payload.push(field.column_number);
+                    vector_payload.extend_from_slice(&row.id.to_le_bytes());
+                    encode_value(&mut vector_payload, value)?;
+                    changed_segments.push(self.append_segment_record(
+                        VECTOR_DATA_TYPE,
+                        table_number,
+                        field.column_number,
+                        &vector_payload,
+                    )?);
+                }
+            }
+            for id in deleted_ids {
+                let mut payload = vec![SEGMENT_TOMBSTONE];
+                payload.extend_from_slice(&transaction_id.to_le_bytes());
+                payload.extend_from_slice(&table_number.to_le_bytes());
+                payload.extend_from_slice(&id.to_le_bytes());
+                changed_segments.push(self.append_segment_record(
+                    TABLE_DATA_TYPE,
+                    table_number,
+                    0,
+                    &payload,
+                )?);
+            }
+            self.append_transaction_marker(8, transaction_id)
+        })();
+
+        if let Err(error) = result {
+            for (offset, used) in changed_segments.into_iter().rev() {
+                self.restore_segment_used(offset, used)?;
+            }
+            self.file.set_len(original_length)?;
+            self.file.sync_all()?;
+            return Err(error);
+        }
+        self.file.sync_all()?;
+        Ok(())
+    }
+
+    fn append_transaction_marker(
+        &mut self,
+        operation: u8,
+        transaction_id: u64,
+    ) -> Result<(), DatabaseError> {
+        let mut payload = vec![operation];
+        payload.extend_from_slice(&transaction_id.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        self.append_data_record(&payload)
+    }
+
+    fn append_segment_record(
+        &mut self,
+        data_type: u8,
+        table_number: u16,
+        column_number: u8,
+        payload: &[u8],
+    ) -> Result<(u64, u64), DatabaseError> {
+        let length = u32::try_from(payload.len())
+            .map_err(|_| DatabaseError::Validation("segment record is too large".into()))?;
+        let required = SEGMENT_RECORD_HEADER_SIZE
+            .checked_add(u64::from(length))
+            .ok_or(DatabaseError::InvalidDatabase)?;
+
+        let matches = |entry: &SegmentIndexEntry| {
+            entry.segment_id != 0
+                && entry.data_type() == data_type
+                && entry.table_number == table_number
+                && entry.column_number == column_number
+        };
+        let entries = self.segment_index.read_entries(&mut self.file)?;
+        for entry in entries.iter().copied().filter(matches) {
+            let used = self.ensure_segment_header(entry)?;
+            let new_used = used
+                .checked_add(required)
+                .ok_or(DatabaseError::InvalidDatabase)?;
+            if new_used <= entry.total_size {
+                return self.write_segment_payload(entry, used, new_used, length, payload);
+            }
+        }
+
+        let schema = self
+            .catalog
+            .collections()
+            .find(|collection| collection.table_number() == table_number)
+            .ok_or(DatabaseError::InvalidDatabase)?
+            .schema()
+            .clone();
+        let kind = if data_type == TABLE_DATA_TYPE {
+            ReservationKind::Table
+        } else if data_type == VECTOR_DATA_TYPE {
+            ReservationKind::Vector
+        } else {
+            return Err(DatabaseError::InvalidDatabase);
+        };
+        let extension_bytes = StorageScheduler::default()
+            .extension_bytes(
+                &schema,
+                kind,
+                column_number,
+                entries
+                    .iter()
+                    .filter(|entry| matches(entry))
+                    .filter_map(|entry| self.segment_used_bytes(*entry).transpose())
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .sum(),
+                entries
+                    .iter()
+                    .filter(|entry| matches(entry))
+                    .map(|entry| entry.total_size)
+                    .sum(),
+            )
+            .ok_or(DatabaseError::InvalidDatabase)?;
+        self.allocate_reserved_segment(extension_bytes, data_type, table_number, column_number)?;
+        self.segment_reader
+            .refresh(&mut self.file, &self.segment_index)?;
+        let entry = self
+            .segment_index
+            .read_entries(&mut self.file)?
+            .into_iter()
+            .filter(matches)
+            .max_by_key(|entry| entry.segment_id)
+            .ok_or(DatabaseError::InvalidDatabase)?;
+        let used = self.ensure_segment_header(entry)?;
+        let new_used = used
+            .checked_add(required)
+            .ok_or(DatabaseError::InvalidDatabase)?;
+        if new_used > entry.total_size {
+            return Err(DatabaseError::Io(std::io::Error::other(
+                "segment record exceeds scheduler allocation",
+            )));
+        }
+        self.write_segment_payload(entry, used, new_used, length, payload)
+    }
+
+    fn write_segment_payload(
+        &mut self,
+        entry: SegmentIndexEntry,
+        used: u64,
+        new_used: u64,
+        length: u32,
+        payload: &[u8],
+    ) -> Result<(u64, u64), DatabaseError> {
+        self.file.seek(SeekFrom::Start(entry.offset + used))?;
+        self.file
+            .write_all(crate::storage::reader::DATA_RECORD_MAGIC)?;
+        self.file.write_all(&length.to_le_bytes())?;
+        self.file.write_all(payload)?;
+        self.file.seek(SeekFrom::Start(entry.offset + 8))?;
+        self.file.write_all(&new_used.to_le_bytes())?;
+        Ok((entry.offset, used))
+    }
+
+    fn ensure_segment_header(&mut self, entry: SegmentIndexEntry) -> Result<u64, DatabaseError> {
+        if entry.total_size < SEGMENT_HEADER_SIZE {
+            return Err(DatabaseError::InvalidDatabase);
+        }
+        self.file.seek(SeekFrom::Start(entry.offset))?;
+        let mut header = [0u8; 16];
+        self.file.read_exact(&mut header)?;
+        if &header[..8] == SEGMENT_MAGIC {
+            let used = u64::from_le_bytes(header[8..16].try_into().unwrap());
+            if !(SEGMENT_HEADER_SIZE..=entry.total_size).contains(&used) {
+                return Err(DatabaseError::InvalidDatabase);
+            }
+            return Ok(used);
+        }
+        self.file.seek(SeekFrom::Start(entry.offset))?;
+        self.file.write_all(SEGMENT_MAGIC)?;
+        self.file.write_all(&SEGMENT_HEADER_SIZE.to_le_bytes())?;
+        Ok(SEGMENT_HEADER_SIZE)
+    }
+
+    fn restore_segment_used(&mut self, offset: u64, used: u64) -> Result<(), DatabaseError> {
+        self.file.seek(SeekFrom::Start(offset + 8))?;
+        self.file.write_all(&used.to_le_bytes())?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn append_index_record(
         &mut self,
         create: bool,
         collection: &str,
         field: &str,
+        index_type: &str,
+        m: usize,
+        ef_construction: usize,
+        nlist: usize,
     ) -> Result<(), DatabaseError> {
         let mut payload = vec![if create { 4 } else { 5 }];
         encode_string(&mut payload, collection)?;
         encode_string(&mut payload, field)?;
+        encode_string(&mut payload, index_type)?;
+        payload.extend_from_slice(&(m as u64).to_le_bytes());
+        payload.extend_from_slice(&(ef_construction as u64).to_le_bytes());
+        payload.extend_from_slice(&(nlist as u64).to_le_bytes());
         self.append_data_record(&payload)
     }
 
@@ -265,12 +688,161 @@ impl Database {
     }
 
     fn load_data_log(&mut self) -> Result<(), DatabaseError> {
+        let mut pending: Option<(u64, u32, Vec<Vec<u8>>)> = None;
+        let mut committed_transactions = HashSet::new();
         for payload in self
             .segment_reader
             .read_data_records(&mut self.file, &self.segment_index)
             .map_err(|_| DatabaseError::InvalidDatabase)?
         {
-            self.apply_data_record(&payload)?;
+            let op = *payload.first().ok_or(DatabaseError::InvalidDatabase)?;
+            match op {
+                7 => {
+                    if pending.is_some() || payload.len() != 13 {
+                        return Err(DatabaseError::InvalidDatabase);
+                    }
+                    let transaction_id = u64::from_le_bytes(
+                        payload[1..9]
+                            .try_into()
+                            .map_err(|_| DatabaseError::InvalidDatabase)?,
+                    );
+                    let row_count = u32::from_le_bytes(
+                        payload[9..13]
+                            .try_into()
+                            .map_err(|_| DatabaseError::InvalidDatabase)?,
+                    );
+                    if transaction_id == 0 {
+                        return Err(DatabaseError::InvalidDatabase);
+                    }
+                    self.next_transaction_id = self
+                        .next_transaction_id
+                        .max(transaction_id.saturating_add(1));
+                    pending = Some((transaction_id, row_count, Vec::new()));
+                }
+                8 => {
+                    if payload.len() != 13 {
+                        return Err(DatabaseError::InvalidDatabase);
+                    }
+                    let transaction_id = u64::from_le_bytes(
+                        payload[1..9]
+                            .try_into()
+                            .map_err(|_| DatabaseError::InvalidDatabase)?,
+                    );
+                    let row_count = u32::from_le_bytes(
+                        payload[9..13]
+                            .try_into()
+                            .map_err(|_| DatabaseError::InvalidDatabase)?,
+                    );
+                    let (pending_id, expected, records) =
+                        pending.take().ok_or(DatabaseError::InvalidDatabase)?;
+                    if pending_id != transaction_id
+                        || expected != row_count
+                        || records.len() != row_count as usize
+                    {
+                        return Err(DatabaseError::InvalidDatabase);
+                    }
+                    committed_transactions.insert(transaction_id);
+                    for record in records {
+                        self.apply_data_record(&record)?;
+                    }
+                }
+                1 if pending.is_some() => {
+                    pending
+                        .as_mut()
+                        .ok_or(DatabaseError::InvalidDatabase)?
+                        .2
+                        .push(payload);
+                }
+                _ if pending.is_some() => return Err(DatabaseError::InvalidDatabase),
+                _ => self.apply_data_record(&payload)?,
+            }
+        }
+        // An incomplete transaction at the physical tail is intentionally
+        // ignored. Its records become unreachable and are not made live.
+        self.load_segment_records(&committed_transactions)?;
+        Ok(())
+    }
+
+    fn load_segment_records(&mut self, committed: &HashSet<u64>) -> Result<(), DatabaseError> {
+        for record in self
+            .segment_reader
+            .read_logical_records(&mut self.file, committed)?
+        {
+            self.apply_logical_record(record)?;
+        }
+        Ok(())
+    }
+
+    fn apply_logical_record(&mut self, record: LogicalRecord) -> Result<(), DatabaseError> {
+        let table_number = match &record {
+            LogicalRecord::TableUpsert { table_number, .. }
+            | LogicalRecord::VectorUpsert { table_number, .. }
+            | LogicalRecord::Tombstone { table_number, .. } => *table_number,
+        };
+        let collection = self
+            .catalog
+            .collections()
+            .find(|collection| collection.table_number() == table_number)
+            .map(|collection| collection.name().to_string())
+            .ok_or(DatabaseError::InvalidDatabase)?;
+        match record {
+            LogicalRecord::TableUpsert { id, values, .. } => {
+                let rows = self.rows.entry(collection.clone()).or_default();
+                if let Some(row) = rows.iter_mut().find(|row| row.id == id) {
+                    row.values.extend(values);
+                    row.deleted = false;
+                } else {
+                    rows.push(StoredRow {
+                        id,
+                        values,
+                        deleted: false,
+                    });
+                }
+                self.next_row_id = self.next_row_id.max(id.saturating_add(1));
+                self.mutations.record_insert(&collection, id);
+            }
+            LogicalRecord::VectorUpsert {
+                column_number,
+                id,
+                value,
+                ..
+            } => {
+                let row = self
+                    .rows
+                    .entry(collection.clone())
+                    .or_default()
+                    .iter_mut()
+                    .find(|row| row.id == id)
+                    .ok_or(DatabaseError::InvalidDatabase)?;
+                let field = self
+                    .catalog
+                    .get_collection(&collection)
+                    .map_err(|_| DatabaseError::InvalidDatabase)?
+                    .schema()
+                    .fields()
+                    .iter()
+                    .find(|field| field.column_number == column_number)
+                    .ok_or(DatabaseError::InvalidDatabase)?
+                    .name
+                    .clone();
+                if matches!(value, Value::Null) {
+                    row.values.remove(&field);
+                } else {
+                    row.values.insert(field, value);
+                }
+            }
+            LogicalRecord::Tombstone { id, .. } => {
+                if let Some(row) = self
+                    .rows
+                    .entry(collection.clone())
+                    .or_default()
+                    .iter_mut()
+                    .find(|row| row.id == id)
+                {
+                    row.deleted = true;
+                }
+                self.mutations.record_delete(&collection, id);
+            }
         }
         Ok(())
     }
@@ -314,7 +886,25 @@ impl Database {
             }
             4 => {
                 let field = decode_string(payload, &mut cursor)?;
-                self.indexes.insert((collection, field));
+                let index_type = decode_string(payload, &mut cursor)?;
+                let m = u64::from_le_bytes(take_bytes(payload, &mut cursor, 8)?.try_into().unwrap())
+                    as usize;
+                let ef_construction =
+                    u64::from_le_bytes(take_bytes(payload, &mut cursor, 8)?.try_into().unwrap())
+                        as usize;
+                let nlist =
+                    u64::from_le_bytes(take_bytes(payload, &mut cursor, 8)?.try_into().unwrap())
+                        as usize;
+                let index = VectorIndex::build(
+                    &index_type,
+                    &[],
+                    DistanceMetric::Cosine,
+                    m,
+                    ef_construction,
+                    nlist,
+                )
+                .map_err(|_| DatabaseError::InvalidDatabase)?;
+                self.indexes.insert((collection, field), index);
             }
             5 => {
                 let field = decode_string(payload, &mut cursor)?;
@@ -325,7 +915,7 @@ impl Database {
                     .drop_collection(&collection)
                     .map_err(|_| DatabaseError::InvalidDatabase)?;
                 self.rows.remove(&collection);
-                self.indexes.retain(|(name, _)| name != &collection);
+                self.indexes.retain(|(name, _), _| name != &collection);
                 self.mutations.forget_collection(&collection);
             }
             _ => return Err(DatabaseError::InvalidDatabase),
@@ -377,7 +967,6 @@ impl Database {
         let scheduler = StorageScheduler::default();
         for reservation in scheduler.plan_collection(collection.schema()) {
             let data_type = match reservation.kind {
-                ReservationKind::Schema => SCHEMA_DATA_TYPE,
                 ReservationKind::Table => TABLE_DATA_TYPE,
                 ReservationKind::Vector => VECTOR_DATA_TYPE,
             };
@@ -422,6 +1011,9 @@ impl Database {
             0,
         );
         self.file.set_len(offset.saturating_add(bytes))?;
+        self.file.seek(SeekFrom::Start(offset))?;
+        self.file.write_all(SEGMENT_MAGIC)?;
+        self.file.write_all(&SEGMENT_HEADER_SIZE.to_le_bytes())?;
         self.segment_index
             .write_entry(&mut self.file, index, &entry)?;
         Ok(())
@@ -827,7 +1419,10 @@ fn decode_values(
 
 #[cfg(test)]
 mod tests {
-    use super::{Database, TABLE_DATA_TYPE, VECTOR_DATA_TYPE};
+    use super::{
+        Database, InsertRow, SEGMENT_HEADER_SIZE, StoredRow, TABLE_DATA_TYPE, VECTOR_DATA_TYPE,
+        encode_string, encode_values,
+    };
     use crate::result::QueryResult;
 
     fn test_path(name: &str) -> std::path::PathBuf {
@@ -970,6 +1565,30 @@ mod tests {
         )
         .expect("second insert should work");
 
+        let entries = db.segment_entries().to_vec();
+        let table_segment = entries
+            .iter()
+            .copied()
+            .find(|entry| entry.data_type() == TABLE_DATA_TYPE && entry.table_number == 1)
+            .expect("table segment should exist");
+        let vector_segment = entries
+            .iter()
+            .copied()
+            .find(|entry| entry.data_type() == VECTOR_DATA_TYPE && entry.table_number == 1)
+            .expect("vector segment should exist");
+        assert!(
+            db.segment_used_bytes(table_segment)
+                .expect("table usage should be readable")
+                .expect("table usage should be tracked")
+                > SEGMENT_HEADER_SIZE
+        );
+        assert!(
+            db.segment_used_bytes(vector_segment)
+                .expect("vector usage should be readable")
+                .expect("vector usage should be tracked")
+                > SEGMENT_HEADER_SIZE
+        );
+
         let found = db
             .execute(r#"find top 1 near [0, 0] on "items" ("embedding") return "name", _score;"#)
             .expect("search should work");
@@ -1028,6 +1647,299 @@ mod tests {
             .execute(r#"drop index on "items" ("embedding");"#)
             .expect("drop index should work");
         reopened.close().expect("reopened database should close");
+        std::fs::remove_file(path).expect("test database should be removed");
+    }
+
+    #[test]
+    fn hnsw_and_ivf_indexes_search_and_rebuild_on_reopen() {
+        let path = test_path("ann-indexes");
+        let _ = std::fs::remove_file(&path);
+        let mut db = Database::create(&path).expect("database should be created");
+        db.execute(
+            r#"create collection "items" {
+                "id" uint64 primary auto_increment,
+                "embedding" vector<fp32, 2> metric euclidean,
+                "name" text,
+            };"#,
+        )
+        .expect("collection should be created");
+        db.execute(
+            r#"insert into "items"
+                { "embedding": [0, 0], "name": "origin" },
+                { "embedding": [10, 10], "name": "far" },
+                { "embedding": [1, 1], "name": "near" };"#,
+        )
+        .expect("rows should be inserted");
+
+        db.execute(
+            r#"create index on "items" ("embedding") using hnsw with (m = 4, ef_construction = 20);"#,
+        )
+        .expect("hnsw index should be created");
+        assert!(matches!(
+            db.execute(r#"find top 1 near [1, 1] on "items" ("embedding") return "name";"#)
+                .expect("hnsw search should work"),
+            QueryResult::Rows { .. }
+        ));
+        db.execute(r#"drop index on "items" ("embedding");"#)
+            .expect("hnsw index should be dropped");
+        db.execute(r#"create index on "items" ("embedding") using ivf with (nlist = 2);"#)
+            .expect("ivf index should be created");
+        assert!(matches!(
+            db.execute(
+                r#"find top 1 near [1, 1] on "items" ("embedding") search nprobe 2 return "name";"#
+            )
+            .expect("ivf search should work"),
+            QueryResult::Rows { .. }
+        ));
+        db.close().expect("database should close");
+
+        let mut reopened = Database::open(&path).expect("database should reopen");
+        assert_eq!(reopened.indexes.len(), 1);
+        reopened
+            .execute(r#"find top 1 near [1, 1] on "items" ("embedding") return "name";"#)
+            .expect("reopened ivf search should work");
+        reopened.close().expect("reopened database should close");
+        std::fs::remove_file(path).expect("test database should be removed");
+    }
+
+    #[test]
+    fn bulk_insert_dql_round_trip() {
+        let path = test_path("bulk-dql");
+        let _ = std::fs::remove_file(&path);
+        let mut db = Database::create(&path).expect("database should be created");
+        db.execute(
+            r#"create collection "docs" {
+                "id" uint64 primary auto_increment,
+                "body" text,
+            };"#,
+        )
+        .expect("collection should be created");
+
+        let result = db
+            .execute(
+                r#"insert into "docs"
+                { "body": "first" },
+                { "body": "second" };
+                "#,
+            )
+            .expect("bulk insert should work");
+        assert!(matches!(
+            result,
+            QueryResult::Affected {
+                rows_affected: 2,
+                last_insert_id: Some(crate::dql::ast::Value::Number(ref id)),
+            } if id == "2"
+        ));
+        assert_eq!(db.live_record_ids("docs").collect::<Vec<_>>(), vec![1, 2]);
+        db.close().expect("database should close");
+
+        let reopened = Database::open(&path).expect("database should reopen");
+        assert_eq!(
+            reopened.live_record_ids("docs").collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        reopened.close().expect("reopened database should close");
+        std::fs::remove_file(path).expect("test database should be removed");
+    }
+
+    #[test]
+    fn typed_bulk_insert_validates_before_writing() {
+        let path = test_path("bulk-api");
+        let _ = std::fs::remove_file(&path);
+        let mut db = Database::create(&path).expect("database should be created");
+        db.execute(
+            r#"create collection "docs" {
+                "id" uint64 primary auto_increment,
+                "body" text,
+                "embedding" vector<fp32, 2> metric cosine,
+            };"#,
+        )
+        .expect("collection should be created");
+
+        let result = db
+            .insert_many(
+                "docs",
+                vec![
+                    InsertRow::new()
+                        .text("body", "first")
+                        .vector("embedding", [1.0_f32, 0.0]),
+                    InsertRow::new()
+                        .text("body", "invalid")
+                        .vector("embedding", [0.0_f32]),
+                ],
+            )
+            .expect_err("invalid batch should fail");
+        assert!(matches!(
+            result,
+            crate::errors::DatabaseError::Validation(_)
+        ));
+        assert_eq!(db.live_record_count("docs"), 0);
+
+        let result = db
+            .insert_many(
+                "docs",
+                vec![
+                    InsertRow::new()
+                        .text("body", "first")
+                        .vector("embedding", [1.0_f32, 0.0]),
+                    InsertRow::new()
+                        .text("body", "second")
+                        .vector("embedding", [0.0_f32, 1.0]),
+                ],
+            )
+            .expect("typed bulk insert should work");
+        assert!(matches!(
+            result,
+            QueryResult::Affected {
+                rows_affected: 2,
+                ..
+            }
+        ));
+        assert_eq!(db.live_record_count("docs"), 2);
+        db.close().expect("database should close");
+        std::fs::remove_file(path).expect("test database should be removed");
+    }
+
+    #[test]
+    fn table_segment_rolls_over_when_extent_is_full() {
+        let path = test_path("segment-rollover");
+        let _ = std::fs::remove_file(&path);
+        let mut db = Database::create(&path).expect("database should be created");
+        db.execute(
+            r#"create collection "docs" {
+                "id" uint64 primary auto_increment,
+                "body" text,
+            };"#,
+        )
+        .expect("collection should be created");
+
+        let table_entry_index = db
+            .segment_index
+            .read_entries(&mut db.file)
+            .expect("segment index should be readable")
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| {
+                entry.segment_id != 0
+                    && entry.data_type() == TABLE_DATA_TYPE
+                    && entry.table_number == 1
+            })
+            .map(|(index, _)| index as u32)
+            .expect("table segment should exist");
+        let mut forced_full = db
+            .segment_index
+            .read_entry(&mut db.file, table_entry_index)
+            .expect("table segment should be readable");
+        forced_full.total_size = SEGMENT_HEADER_SIZE + 1;
+        db.segment_index
+            .write_entry(&mut db.file, table_entry_index, &forced_full)
+            .expect("test segment metadata should be writable");
+        db.file
+            .set_len(forced_full.offset + forced_full.total_size)
+            .expect("test segment should be truncated consistently");
+
+        db.insert_many("docs", vec![InsertRow::new().text("body", "roll over")])
+            .expect("scheduler should allocate a rollover extent");
+
+        let table_segments = db
+            .segment_entries()
+            .iter()
+            .filter(|entry| {
+                entry.segment_id != 0
+                    && entry.data_type() == TABLE_DATA_TYPE
+                    && entry.table_number == 1
+            })
+            .count();
+        assert!(table_segments >= 2);
+        assert_eq!(db.live_record_count("docs"), 1);
+        db.close().expect("database should close");
+
+        let reopened = Database::open(&path).expect("database should reopen");
+        assert_eq!(reopened.live_record_count("docs"), 1);
+        reopened.close().expect("reopened database should close");
+        std::fs::remove_file(path).expect("test database should be removed");
+    }
+
+    #[test]
+    fn incomplete_bulk_transaction_is_ignored_on_reopen() {
+        let path = test_path("bulk-incomplete");
+        let _ = std::fs::remove_file(&path);
+        let mut db = Database::create(&path).expect("database should be created");
+        db.execute(
+            r#"create collection "docs" {
+                "id" uint64 primary auto_increment,
+                "body" text,
+            };"#,
+        )
+        .expect("collection should be created");
+
+        let mut begin = vec![7u8];
+        begin.extend_from_slice(&42_u64.to_le_bytes());
+        begin.extend_from_slice(&1_u32.to_le_bytes());
+        db.append_data_record(&begin)
+            .expect("transaction begin should append");
+
+        let row = StoredRow {
+            id: 1,
+            values: [(
+                "body".to_string(),
+                crate::dql::ast::Value::String("orphan".into()),
+            )]
+            .into_iter()
+            .collect(),
+            deleted: false,
+        };
+        let mut payload = vec![1u8];
+        encode_string(&mut payload, "docs").expect("collection should encode");
+        payload.extend_from_slice(&row.id.to_le_bytes());
+        encode_values(&mut payload, &row.values).expect("row should encode");
+        db.append_data_record(&payload).expect("row should append");
+        db.close().expect("database should close");
+
+        let reopened = Database::open(&path).expect("incomplete tail should be recoverable");
+        assert_eq!(reopened.live_record_count("docs"), 0);
+        assert!(reopened.rows("docs").is_empty());
+        reopened.close().expect("reopened database should close");
+        std::fs::remove_file(path).expect("test database should be removed");
+    }
+
+    #[test]
+    fn diagnostic_dql_commands_return_rows() {
+        let path = test_path("diagnostics");
+        let _ = std::fs::remove_file(&path);
+        let mut db = Database::create(&path).expect("database should be created");
+        db.execute(
+            r#"create collection "docs" {
+                "id" uint64 primary auto_increment,
+                "status" text,
+                "body" text,
+            };"#,
+        )
+        .expect("collection should be created");
+        db.execute(
+            r#"insert into "docs"
+                { "status": "active", "body": "one" },
+                { "status": "inactive", "body": "two" };"#,
+        )
+        .expect("rows should be inserted");
+
+        for query in [
+            r#"get from "docs" filter on "status" = "active" return "id", "body";"#,
+            r#"get from "docs" return "id", "status";"#,
+            r#"check collection "docs";"#,
+            r#"check database;"#,
+            r#"stats collection "docs";"#,
+            r#"stats database;"#,
+            r#"show segments;"#,
+            r#"show segments on "docs";"#,
+        ] {
+            assert!(matches!(
+                db.execute(query).expect("diagnostic query should execute"),
+                QueryResult::Rows { .. }
+            ));
+        }
+
+        db.close().expect("database should close");
         std::fs::remove_file(path).expect("test database should be removed");
     }
 }

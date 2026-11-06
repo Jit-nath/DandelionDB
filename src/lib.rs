@@ -1,15 +1,17 @@
 pub(crate) mod catalog;
-pub mod dql;
-pub mod errors;
+pub(crate) mod dql;
+pub(crate) mod errors;
 pub(crate) mod execution;
 pub(crate) mod index;
-// pub(crate) mod storage;
-pub(crate) mod types;
+pub mod types;
 
-pub mod storage;
+pub(crate) mod storage;
 
 mod engine;
 mod result;
 
-pub use engine::Database;
+pub use dql::ast::Value;
+pub use engine::{Database, InsertRow};
+pub use errors::DatabaseError;
 pub use result::{Column, QueryResult, Row};
+pub use types::{DataType, DistanceMetric, ScalarType, VectorElementType, VectorType};

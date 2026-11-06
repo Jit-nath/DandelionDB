@@ -124,6 +124,10 @@ impl Parser {
             Token::Update => self.parse_update(),
             Token::Delete => self.parse_delete(),
             Token::Find => self.parse_find(),
+            Token::Get => self.parse_get(),
+            Token::Check => self.parse_check(),
+            Token::Stats => self.parse_stats(),
+            Token::Show => self.parse_show(),
 
             Token::Eof => Err("Expected statement".to_string()),
 
@@ -334,6 +338,21 @@ impl Parser {
 
         self.expect(Token::LBrace)?;
 
+        let values = self.parse_insert_values()?;
+        let mut rows = vec![values];
+
+        while matches!(self.current(), Token::Comma) {
+            self.advance();
+            self.expect(Token::LBrace)?;
+            rows.push(self.parse_insert_values()?);
+        }
+
+        self.expect(Token::Semicolon)?;
+
+        Ok(Statement::Insert(Insert { collection, rows }))
+    }
+
+    fn parse_insert_values(&mut self) -> Result<Vec<FieldValue>, String> {
         let mut values = Vec::new();
 
         while !matches!(self.current(), Token::RBrace | Token::Eof) {
@@ -361,9 +380,10 @@ impl Parser {
         }
 
         self.expect(Token::RBrace)?;
-        self.expect(Token::Semicolon)?;
-
-        Ok(Statement::Insert(Insert { collection, values }))
+        if values.is_empty() {
+            return Err("Insert row cannot be empty".to_string());
+        }
+        Ok(values)
     }
 
     fn parse_update(&mut self) -> Result<Statement, String> {
@@ -531,6 +551,74 @@ impl Parser {
             search,
             return_fields,
         }))
+    }
+
+    fn parse_get(&mut self) -> Result<Statement, String> {
+        self.expect(Token::Get)?;
+        self.expect(Token::From)?;
+        let collection = self.parse_string("Expected collection name")?;
+        let filter = if matches!(self.current(), Token::Filter) {
+            Some(self.parse_filter()?)
+        } else {
+            None
+        };
+        self.expect(Token::Return)?;
+        let return_fields = self.parse_return_fields()?;
+        self.expect(Token::Semicolon)?;
+        Ok(Statement::Get(Get {
+            collection,
+            filter,
+            return_fields,
+        }))
+    }
+
+    fn parse_check(&mut self) -> Result<Statement, String> {
+        self.expect(Token::Check)?;
+        match self.current() {
+            Token::Collection => {
+                self.advance();
+                let collection = self.parse_string("Expected collection name")?;
+                self.expect(Token::Semicolon)?;
+                Ok(Statement::CheckCollection(CheckCollection { collection }))
+            }
+            Token::Database => {
+                self.advance();
+                self.expect(Token::Semicolon)?;
+                Ok(Statement::CheckDatabase)
+            }
+            _ => Err("Expected 'collection' or 'database'".to_string()),
+        }
+    }
+
+    fn parse_stats(&mut self) -> Result<Statement, String> {
+        self.expect(Token::Stats)?;
+        match self.current() {
+            Token::Collection => {
+                self.advance();
+                let collection = self.parse_string("Expected collection name")?;
+                self.expect(Token::Semicolon)?;
+                Ok(Statement::StatsCollection(StatsCollection { collection }))
+            }
+            Token::Database => {
+                self.advance();
+                self.expect(Token::Semicolon)?;
+                Ok(Statement::StatsDatabase)
+            }
+            _ => Err("Expected 'collection' or 'database'".to_string()),
+        }
+    }
+
+    fn parse_show(&mut self) -> Result<Statement, String> {
+        self.expect(Token::Show)?;
+        self.expect(Token::Segments)?;
+        let collection = if matches!(self.current(), Token::On) {
+            self.advance();
+            Some(self.parse_string("Expected collection name")?)
+        } else {
+            None
+        };
+        self.expect(Token::Semicolon)?;
+        Ok(Statement::ShowSegments(ShowSegments { collection }))
     }
 
     fn parse_top_clause(&mut self) -> Result<TopClause, String> {

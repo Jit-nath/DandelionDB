@@ -106,14 +106,6 @@ impl SegmentIndex {
         }
     }
 
-    pub fn offset(&self) -> u64 {
-        self.offset
-    }
-
-    pub fn capacity(&self) -> u32 {
-        self.capacity
-    }
-
     pub fn size(&self) -> u64 {
         self.capacity as u64 * Self::ENTRY_SIZE
     }
@@ -153,6 +145,7 @@ impl SegmentIndex {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn read_entry(&self, file: &mut File, index: u32) -> io::Result<SegmentIndexEntry> {
         let offset = self.entry_offset(index).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "segment index out of bounds")

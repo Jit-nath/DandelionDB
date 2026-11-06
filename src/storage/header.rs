@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 pub const MAGIC: &[u8; 11] = b"DANDELIONDB";
 
 pub const HEADER_VERSION_MAJOR: u32 = 0;
-pub const HEADER_VERSION_MINOR: u32 = 1;
+pub const HEADER_VERSION_MINOR: u32 = 2;
 pub const HEADER_VERSION_PATCH: u32 = 0;
 
 pub const CHECKSUM_ENABLED: u8 = 1 << 0;
@@ -25,10 +25,6 @@ impl Header {
             patch: HEADER_VERSION_PATCH,
             flags: CHECKSUM_ENABLED,
         }
-    }
-
-    pub fn checksum_enabled(&self) -> bool {
-        self.flags & CHECKSUM_ENABLED != 0
     }
 
     pub fn write_to<W: Write>(&self, writer: &mut W) -> std::io::Result<()> {
@@ -68,9 +64,11 @@ impl Header {
             flags: flags[0],
         })
     }
+}
 
-    pub fn version(&self) -> (u32, u32, u32) {
-        (self.major, self.minor, self.patch)
+impl Default for Header {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
