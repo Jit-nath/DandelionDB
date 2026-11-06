@@ -10,7 +10,6 @@ use crate::dql::validator::validate;
 use crate::index::VectorIndex;
 
 use crate::storage::header::{HEADER_VERSION_MAJOR, HEADER_VERSION_MINOR, Header};
-use crate::storage::helpers::validate_create_path;
 use crate::storage::mutation::DataMutationProcess;
 use crate::storage::reader::{LogicalRecord, SegmentReader};
 use crate::storage::scheduler::{ReservationKind, StorageScheduler};
@@ -104,6 +103,7 @@ impl InsertRow {
 /// `Database` is intentionally single-process and synchronous. Keep one
 /// mutable handle for a file, call [`Database::close`] when finished, and use
 /// [`Database::open`] to reconstruct the catalog, rows, and indexes later.
+
 #[derive(Debug)]
 pub struct Database {
     file: File,
@@ -120,37 +120,60 @@ pub struct Database {
 }
 
 impl Database {
-    /// Creates a new `.lion` database at `path`.
+
+    /// Creates a new LionDB database at the specified path.
     ///
-    /// The parent directory must already exist and the target must not exist.
+    /// The parent directory must exist, and the target file must not already exist.
+    ///
+    /// # Errors
+    /// - `InvalidDatabasePath`: Invalid path or missing `.lion` extension.
+    /// - `ParentDirectoryNotFound`: Parent directory does not exist.
+    /// - `DatabaseAlreadyExists`: A file already exists at the specified path.
+    /// - `Io`: File creation or initialization failed.
     pub fn create(path: impl AsRef<Path>) -> Result<Self, DatabaseError> {
         let path = path.as_ref();
 
-        // 1. Validate database path
-        validate_create_path(path)?;
+        // Validate database path
+        if path.extension() != Some(std::ffi::OsStr::new("lion")) {
+            return Err(DatabaseError::InvalidDatabasePath);
+        }
 
-        // 2. Create the file
+        let parent = path
+            .parent()
+            .ok_or(DatabaseError::InvalidDatabasePath)?;
+
+        if !parent.exists() {
+            return Err(DatabaseError::ParentDirectoryNotFound);
+        }
+
+        if !parent.is_dir() {
+            return Err(DatabaseError::InvalidDatabasePath);
+        }
+
+        if path.exists() {
+            return Err(DatabaseError::DatabaseAlreadyExists);
+        }
+
+        // Create database file
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
             .open(path)?;
 
-        // 3. Create initial database structures
+        // Initialize database structures
         let header = Header::new();
-
-        // Segment index starts immediately after the header
         let segment_index = SegmentIndex::new();
 
-        // 4. Write initial file structure
         header.write_to(&mut file)?;
-        segment_index.initialize(&mut file)?;
+        segment_index.write_to(&mut file)?;
+
         let segment_reader = SegmentReader::load(&mut file, &segment_index)?;
 
-        // 5. Make initial state durable
+        // Persist initial database state
         file.sync_all()?;
 
-        // 6. Construct in-memory database
+        // Initialize in-memory state
         Ok(Self {
             file,
             path: path.to_path_buf(),
@@ -165,7 +188,15 @@ impl Database {
         })
     }
 
-    /// Opens an existing `.lion` file and replays its durable state.
+    /// Opens an existing dandelionDB database.
+    ///
+    /// The file must have a `.lion` extension and a valid database structure.
+    ///
+    /// # Errors
+    /// - `DatabaseNotFound`: Database file does not exist.
+    /// - `InvalidDatabasePath`: Path is not a valid `.lion` file.
+    /// - `InvalidDatabase`: File has an invalid or incomplete structure.
+    /// - `UnsupportedDatabaseVersion`: Database format is not supported.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DatabaseError> {
         let path = path.as_ref();
 
@@ -173,9 +204,14 @@ impl Database {
         if !path.exists() {
             return Err(DatabaseError::DatabaseNotFound);
         }
-        if path.extension().and_then(|extension| extension.to_str()) != Some("lion")
-            || !path.is_file()
-        {
+
+        // 2. Check it's a valid database file
+        if !path.is_file() {
+            return Err(DatabaseError::InvalidDatabasePath);
+        }
+
+        // 3. Check file extension
+        if path.extension() != Some(std::ffi::OsStr::new("lion")) {
             return Err(DatabaseError::InvalidDatabasePath);
         }
 
@@ -191,6 +227,8 @@ impl Database {
         let header = Header::read_from(&mut file).map_err(|_| DatabaseError::InvalidDatabase)?;
 
         if header.major != HEADER_VERSION_MAJOR || header.minor != HEADER_VERSION_MINOR {
+            // currently in development
+            // backward compatibility will be added later
             return Err(DatabaseError::UnsupportedDatabaseVersion);
         }
 
@@ -220,19 +258,26 @@ impl Database {
 
     /// Parses, validates, and executes one DQL statement.
     pub fn execute(&mut self, query: &str) -> Result<crate::result::QueryResult, DatabaseError> {
-        // Step 1: Tokenization
-        let tokens = tokenize(query).map_err(|err| DatabaseError::Tokenizer(err.to_string()))?;
+        // Tokenization
+        let tokens = match tokenize(query) {
+            Ok(tokens) => tokens,
+            Err(err) => return Err(DatabaseError::Tokenizer(err.to_string())),
+        };
 
-        // Step 2: Parsing
+        // Parsing
         let mut parser = Parser::new(tokens);
 
-        let ast = parser
-            .parse()
-            .map_err(|err| DatabaseError::Parser(err.to_string()))?;
+        let ast = match parser.parse() {
+            Ok(ast) => ast,
+            Err(err) => return Err(DatabaseError::Parser(err.to_string())),
+        };
 
-        // Step 3: Validation
-        validate(&ast).map_err(|err| DatabaseError::Validation(err.to_string()))?;
+        // Validation
+        if let Err(err) = validate(&ast) {
+            return Err(DatabaseError::Validation(err.to_string()));
+        }
 
+        // Execution
         execute_statement(self, &ast)
     }
 

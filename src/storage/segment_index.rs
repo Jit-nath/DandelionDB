@@ -125,7 +125,7 @@ impl SegmentIndex {
         Some(self.offset + index as u64 * Self::ENTRY_SIZE)
     }
 
-    pub fn initialize(&self, file: &mut File) -> io::Result<()> {
+    pub fn write_to(&self, file: &mut File) -> io::Result<()> {
         let end = self.offset.checked_add(self.size()).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "segment index size overflow")
         })?;

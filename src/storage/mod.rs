@@ -4,7 +4,6 @@
 //! application-facing API; use `Database` and DQL from outside the crate.
 
 pub mod header;
-pub mod helpers;
 pub mod mutation;
 pub mod reader;
 pub mod scheduler;
