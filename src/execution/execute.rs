@@ -1,3 +1,9 @@
+//! Statement execution.
+//!
+//! This module is the boundary between validated DQL AST values and database
+//! state. Keep parser concerns out of here: execution should receive a valid
+//! statement and focus on catalog checks, row mutation, indexing, and results.
+
 use std::cmp::Ordering;
 use std::collections::HashMap;
 

@@ -3,6 +3,10 @@
 //! The execution engine asks this component for segments and durable log
 //! records. It owns traversal, bounds checks, and the skip logic for reserved
 //! extents; it never writes, inserts, deletes, or changes a segment index.
+//!
+//! If a query or execution path needs to seek through segment bytes, add that
+//! behavior here and return a logical type rather than exposing file offsets
+//! to callers.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;

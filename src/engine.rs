@@ -42,16 +42,22 @@ pub(crate) struct StoredRow {
 }
 
 /// A typed row used by [`Database::insert_many`].
+///
+/// The builder does not write anything by itself. Rows are validated as a
+/// batch by the execution layer, then committed to the table/vector segments
+/// together.
 #[derive(Debug, Clone, Default)]
 pub struct InsertRow {
     pub(crate) values: Vec<FieldValue>,
 }
 
 impl InsertRow {
+    /// Creates an empty row builder.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Adds a value using the public [`Value`] representation.
     pub fn value(mut self, field: impl Into<String>, value: Value) -> Self {
         self.values.push(FieldValue {
             field: field.into(),
@@ -60,22 +66,27 @@ impl InsertRow {
         self
     }
 
+    /// Adds a text value.
     pub fn text(self, field: impl Into<String>, value: impl Into<String>) -> Self {
         self.value(field, Value::String(value.into()))
     }
 
+    /// Adds a number encoded as the database's textual numeric representation.
     pub fn number(self, field: impl Into<String>, value: impl ToString) -> Self {
         self.value(field, Value::Number(value.to_string()))
     }
 
+    /// Adds a boolean value.
     pub fn boolean(self, field: impl Into<String>, value: bool) -> Self {
         self.value(field, Value::Boolean(value))
     }
 
+    /// Adds a nullable value.
     pub fn null(self, field: impl Into<String>) -> Self {
         self.value(field, Value::Null)
     }
 
+    /// Adds a vector and converts each element with [`ToString`].
     pub fn vector<I, T>(self, field: impl Into<String>, values: I) -> Self
     where
         I: IntoIterator<Item = T>,
@@ -88,6 +99,11 @@ impl InsertRow {
     }
 }
 
+/// An opened DandelionDB database.
+///
+/// `Database` is intentionally single-process and synchronous. Keep one
+/// mutable handle for a file, call [`Database::close`] when finished, and use
+/// [`Database::open`] to reconstruct the catalog, rows, and indexes later.
 #[derive(Debug)]
 pub struct Database {
     file: File,
@@ -104,6 +120,9 @@ pub struct Database {
 }
 
 impl Database {
+    /// Creates a new `.lion` database at `path`.
+    ///
+    /// The parent directory must already exist and the target must not exist.
     pub fn create(path: impl AsRef<Path>) -> Result<Self, DatabaseError> {
         let path = path.as_ref();
 
@@ -146,6 +165,7 @@ impl Database {
         })
     }
 
+    /// Opens an existing `.lion` file and replays its durable state.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DatabaseError> {
         let path = path.as_ref();
 
@@ -198,6 +218,7 @@ impl Database {
         Ok(database)
     }
 
+    /// Parses, validates, and executes one DQL statement.
     pub fn execute(&mut self, query: &str) -> Result<crate::result::QueryResult, DatabaseError> {
         // Step 1: Tokenization
         let tokens = tokenize(query).map_err(|err| DatabaseError::Tokenizer(err.to_string()))?;
@@ -215,6 +236,7 @@ impl Database {
         execute_statement(self, &ast)
     }
 
+    /// Inserts typed rows after validating the whole batch.
     pub fn insert_many<I>(
         &mut self,
         collection: impl AsRef<str>,

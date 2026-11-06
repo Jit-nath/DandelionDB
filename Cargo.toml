@@ -2,6 +2,8 @@
 name = "dandeliondb"
 version = "0.1.0"
 edition = "2024"
+description = "An embedded, single-file Rust database with typed records and vector retrieval"
+license = "MIT"
 
 [profile.release]
 opt-level = 3

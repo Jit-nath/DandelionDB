@@ -1,3 +1,10 @@
+//! DandelionDB: an embedded, single-file database with typed vector search.
+//!
+//! The stable application boundary is [`Database`]. Query text goes through
+//! tokenization, parsing, validation, and execution; callers do not need to
+//! construct internal AST or storage objects. [`InsertRow`] is the typed Rust
+//! alternative to building an INSERT string.
+
 pub(crate) mod catalog;
 pub(crate) mod dql;
 pub(crate) mod errors;

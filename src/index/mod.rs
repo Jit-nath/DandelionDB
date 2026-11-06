@@ -1,3 +1,9 @@
+//! In-memory vector indexes.
+//!
+//! Indexes return candidate row IDs only. The execution layer still performs
+//! exact metric scoring and result ordering, so index implementations must
+//! never mutate rows or become the source of truth for stored data.
+
 mod hnsw;
 mod ivf;
 

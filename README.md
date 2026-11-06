@@ -100,6 +100,78 @@ Search can tune the approximate search budget with `search ef N` for HNSW or
 `search nprobe N` for IVF. Exact distance ranking is applied to the candidates
 returned by the selected index.
 
+## Codebase map
+
+Start at [`src/lib.rs`](src/lib.rs). It defines the public API and intentionally
+keeps parser, execution, catalog, index, and storage implementation modules
+internal.
+
+| Area | Responsibility | Change it when |
+| --- | --- | --- |
+| `engine.rs` | Database lifecycle, persistence orchestration, recovery, and in-memory state | Adding a lifecycle or durable-state transition |
+| `dql/` | Tokens, parsing, AST construction, and validation | Adding or changing DQL syntax |
+| `execution/execute.rs` | Applies validated statements and creates `QueryResult` values | Changing database behavior or query semantics |
+| `catalog/` | Collections, fields, schemas, and table numbers | Changing schema rules or catalog metadata |
+| `storage/reader.rs` | Physical segment validation and physical-to-logical decoding | Reading bytes from a `.lion` file |
+| `storage/mutation.rs` | Append-only journal records | Changing journal writes or transaction markers |
+| `storage/segment_index.rs` | Fixed-capacity segment directory | Changing segment allocation metadata |
+| `storage/scheduler.rs` | Initial reservations and rollover sizing | Changing storage allocation policy |
+| `index/` | In-memory HNSW/IVF candidate selection | Changing approximate vector search |
+| `result.rs` | Public query result and column/row types | Changing the public result shape |
+
+## Request and storage flows
+
+Normal DQL execution follows this order:
+
+```text
+Database::execute
+  -> tokenize
+  -> Parser::parse
+  -> validate
+  -> execute_statement
+  -> QueryResult
+```
+
+Writes have two coordinated paths. The execution layer validates and changes
+logical in-memory rows; the engine appends durable journal/segment records. A
+failed physical write must not update the in-memory row state.
+
+```text
+validated INSERT/UPDATE/DELETE
+  -> append transaction markers and segment records
+  -> sync durable bytes
+  -> update in-memory rows and live-ID tracker
+```
+
+On reopen, `SegmentReader` owns file traversal and decoding. It returns logical
+table/vector/tombstone records to the engine; query code should never seek
+through the file directly. Vector indexes are rebuilt after logical recovery.
+
+## Coding rules and safe extension points
+
+- Keep public API changes in `src/lib.rs` deliberate. Prefer a root re-export
+  over exposing an implementation module.
+- Add new DQL syntax in all four places: tokenization, parser/AST, validator,
+  and execution. Add a round-trip or rejection test beside the behavior.
+- Do not put file reads in `execution/` or vector search. Add physical decoding
+  to `storage/reader.rs` and return a logical type.
+- Do not make indexes the source of truth. Indexes may return candidate IDs;
+  rows and exact metric scoring remain authoritative.
+- For storage-format changes, update the header version, document the change,
+  and add a create/close/open recovery test.
+- For new write paths, test both immediate reads and reopen recovery. Also test
+  incomplete transactions and segment rollover when relevant.
+- Keep segment ownership explicit: table scalar values belong to table
+  segments, and each vector column belongs to its own vector segment.
+
+## A practical manual-coding loop
+
+1. Read the relevant row in the codebase map above.
+2. Find the nearest behavior test in `src/engine.rs` or the owning module.
+3. Make the smallest change at the correct boundary.
+4. Run `cargo fmt`, the focused test, then the full checks below.
+5. If persistence changed, close and reopen a temporary `.lion` file in a test.
+
 ## Current guarantees and limitations
 
 - The crate is embedded and single-process. It has no server, network API,
