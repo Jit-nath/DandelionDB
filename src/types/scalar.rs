@@ -1,3 +1,5 @@
+//! Scalar field types accepted by collection schemas.
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarType {
     UInt8,

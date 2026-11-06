@@ -1,3 +1,5 @@
+//! Collection metadata and its durable table number.
+
 use super::schema::Schema;
 
 #[derive(Debug, Clone)]

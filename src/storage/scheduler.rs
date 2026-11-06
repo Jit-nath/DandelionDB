@@ -39,6 +39,7 @@ impl Default for StorageScheduler {
 }
 
 impl StorageScheduler {
+    /// Creates a scheduler with a minimum forecast of one record.
     pub fn new(record_forecast: u64) -> Self {
         Self {
             record_forecast: record_forecast.max(1),

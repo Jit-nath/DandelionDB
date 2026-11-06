@@ -1,3 +1,5 @@
+//! Versioned file header and format feature flags.
+
 use std::io::{Read, Write};
 
 pub const MAGIC: &[u8; 11] = b"DANDELIONDB";

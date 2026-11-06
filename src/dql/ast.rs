@@ -1,3 +1,8 @@
+//! Validated query-language data structures.
+//!
+//! AST fields are intentionally internal because application code should use
+//! [`crate::Database::execute`] rather than construct statements directly.
+
 #[derive(Debug)]
 pub enum Statement {
     CreateCollection(CreateCollection),

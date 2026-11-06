@@ -1,3 +1,8 @@
+//! Converts a token stream into one validated-shape AST statement.
+//!
+//! Parsing handles grammar only. Names, field types, and operation rules
+//! belong in `validator.rs`, not in this module.
+
 use crate::dql::ast::*;
 use crate::dql::token::Token;
 

@@ -1,3 +1,5 @@
+//! Small storage precondition helpers shared by database creation.
+
 use crate::errors::DatabaseError;
 use std::path::Path;
 

@@ -1,3 +1,5 @@
+//! Converts DQL characters into tokens without performing semantic checks.
+
 use crate::dql::token::Token;
 
 pub fn tokenize(input: &str) -> Result<Vec<Token>, String> {

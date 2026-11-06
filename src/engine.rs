@@ -327,17 +327,19 @@ impl Database {
         Ok(())
     }
 
+    /// Flushes all pending file writes and consumes the database handle.
     pub fn close(self) -> Result<(), DatabaseError> {
         self.file.sync_all()?;
 
         Ok(())
     }
 
+    /// Returns the path of the backing `.lion` file.
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    pub fn catalog(&self) -> &Catalog {
+    pub(crate) fn catalog(&self) -> &Catalog {
         &self.catalog
     }
 
@@ -353,14 +355,17 @@ impl Database {
         self.rows.entry(collection.to_string()).or_default()
     }
 
+    /// Returns the number of non-deleted records in a collection.
     pub fn live_record_count(&self, collection: &str) -> usize {
         self.mutations.live_count(collection)
     }
 
+    /// Reports whether an internal row ID is currently live.
     pub fn is_live_record(&self, collection: &str, id: u64) -> bool {
         self.mutations.is_live(collection, id)
     }
 
+    /// Iterates over live internal row IDs in a collection.
     pub fn live_record_ids(&self, collection: &str) -> impl Iterator<Item = u64> + '_ {
         self.mutations.live_ids(collection)
     }

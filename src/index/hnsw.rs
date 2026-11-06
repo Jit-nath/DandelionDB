@@ -1,3 +1,8 @@
+//! Small in-memory HNSW-style neighbor graph.
+//!
+//! This implementation is dependency-free and returns approximate candidate
+//! IDs; exact ranking remains in the execution layer.
+
 use super::distance;
 use crate::types::DistanceMetric;
 

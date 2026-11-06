@@ -1,3 +1,8 @@
+//! Public result values returned by DQL execution.
+//!
+//! `QueryResult::Affected` represents writes, while `QueryResult::Rows`
+//! carries both column metadata and row values for reads and diagnostics.
+
 use crate::dql::ast::Value;
 use crate::types::DataType;
 

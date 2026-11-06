@@ -1,3 +1,5 @@
+//! Public error categories returned by database operations.
+
 use std::fmt;
 use std::io;
 

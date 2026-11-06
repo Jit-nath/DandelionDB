@@ -1,4 +1,5 @@
 #![allow(clippy::module_inception)]
+//! Catalog types used by the execution and storage layers.
 
 pub mod catalog;
 pub mod collection;

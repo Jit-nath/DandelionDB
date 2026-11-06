@@ -1,3 +1,8 @@
+//! Small in-memory inverted-file vector index.
+//!
+//! IVF assigns each vector to a deterministic centroid. Queries probe nearby
+//! lists and return candidate IDs for exact reranking.
+
 use super::distance;
 use crate::types::DistanceMetric;
 

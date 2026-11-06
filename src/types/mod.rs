@@ -1,3 +1,5 @@
+//! Public schema and vector type definitions.
+
 pub mod scalar;
 pub mod vector;
 

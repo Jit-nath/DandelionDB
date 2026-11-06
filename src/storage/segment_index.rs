@@ -1,3 +1,8 @@
+//! Fixed-capacity directory describing physical segment extents.
+//!
+//! Index entries are metadata only. Segment payloads live at the recorded file
+//! offsets and are validated by `SegmentReader`.
+
 use std::fs::File;
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 
@@ -21,6 +26,7 @@ pub struct SegmentIndexEntry {
 impl SegmentIndexEntry {
     pub const SIZE: usize = 32;
 
+    /// Creates metadata for one physical extent.
     pub fn new(
         segment_id: u32,
         offset: u64,
@@ -99,6 +105,7 @@ impl SegmentIndex {
     pub const CAPACITY: u32 = 500_000;
     pub const OFFSET: u64 = HEADER_SIZE;
 
+    /// Creates the fixed-capacity segment directory descriptor.
     pub fn new() -> Self {
         Self {
             offset: Self::OFFSET,

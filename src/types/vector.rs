@@ -1,3 +1,5 @@
+//! Vector element formats, distance metrics, and vector field metadata.
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VectorElementType {
     Binary,

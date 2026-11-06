@@ -1,3 +1,5 @@
+//! Lexical tokens produced from DQL text.
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     // Keywords

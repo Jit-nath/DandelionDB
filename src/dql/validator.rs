@@ -1,3 +1,9 @@
+//! Semantic validation for parsed DQL statements.
+//!
+//! This is the last stage before execution. Keep checks here when they can be
+//! decided from the statement alone; catalog-dependent checks belong in the
+//! execution layer.
+
 use crate::dql::ast::*;
 
 pub fn validate(statement: &Statement) -> Result<(), String> {

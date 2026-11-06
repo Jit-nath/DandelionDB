@@ -1,3 +1,8 @@
+//! Field definitions and ordered collection schemas.
+//!
+//! `column_number` is part of the storage contract: vector segments use it to
+//! identify the vector field they own.
+
 use crate::types::DataType;
 
 #[derive(Debug, Clone)]
