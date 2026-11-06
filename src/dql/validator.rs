@@ -35,6 +35,29 @@ fn validate_create_collection(stmt: &CreateCollection) -> Result<(), String> {
         }
     }
 
+    let primary_fields: Vec<_> = stmt
+        .fields
+        .iter()
+        .filter(|field| {
+            field
+                .properties
+                .iter()
+                .any(|property| property == "primary")
+        })
+        .collect();
+    if primary_fields.len() > 1 {
+        return Err("A collection can declare at most one primary key".to_string());
+    }
+    for field in &stmt.fields {
+        let has = |property: &str| field.properties.iter().any(|value| value == property);
+        if has("primary") && has("nullable") {
+            return Err("A primary key cannot be nullable".to_string());
+        }
+        if has("auto_increment") && !matches!(field.data_type.as_str(), "uint32" | "uint64") {
+            return Err("auto_increment requires a uint32 or uint64 field".to_string());
+        }
+    }
+
     Ok(())
 }
 
@@ -332,6 +355,26 @@ fn validate_find(stmt: &Find) -> Result<(), String> {
         return Err("Find must return at least one field".to_string());
     }
 
+    match &stmt.vector {
+        VectorExpr::Literal(values) if values.is_empty() => {
+            return Err("Query vector cannot be empty".to_string());
+        }
+        VectorExpr::Literal(values) => {
+            for value in values {
+                let number = value
+                    .parse::<f64>()
+                    .map_err(|_| "Invalid query vector value".to_string())?;
+                if !number.is_finite() {
+                    return Err("Query vector values must be finite".to_string());
+                }
+            }
+        }
+        VectorExpr::Variable(name) if name.is_empty() => {
+            return Err("Variable name cannot be empty".to_string());
+        }
+        VectorExpr::Variable(_) => {}
+    }
+
     Ok(())
 }
 
@@ -367,6 +410,7 @@ fn validate_filter(filter: &FilterExpr) -> Result<(), String> {
 
 fn validate_value(value: &Value) -> Result<(), String> {
     match value {
+        Value::Null => Ok(()),
         Value::String(_) => Ok(()),
         Value::Number(number) => {
             number

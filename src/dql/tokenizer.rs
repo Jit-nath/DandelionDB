@@ -68,8 +68,18 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                         closed = true;
                         break;
                     }
-
-                    value.push(ch);
+                    if ch == '\\' {
+                        let escaped = chars
+                            .next()
+                            .ok_or_else(|| "Unterminated escape".to_string())?;
+                        match escaped {
+                            '"' => value.push('"'),
+                            '\\' => value.push('\\'),
+                            _ => return Err("Unsupported string escape".to_string()),
+                        }
+                    } else {
+                        value.push(ch);
+                    }
                 }
 
                 if !closed {
@@ -135,15 +145,37 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                 }
             }
 
-            c if c.is_ascii_digit() => {
+            c if c.is_ascii_digit() || c == '-' => {
                 let mut value = String::new();
-
-                while let Some(&ch) = chars.peek() {
-                    if ch.is_ascii_digit() || ch == '.' {
-                        value.push(ch);
-                        chars.next();
-                    } else {
-                        break;
+                if c == '-' {
+                    value.push('-');
+                    chars.next();
+                    if !matches!(chars.peek(), Some(next) if next.is_ascii_digit()) {
+                        return Err("Expected digits after '-'".to_string());
+                    }
+                }
+                while matches!(chars.peek(), Some(ch) if ch.is_ascii_digit()) {
+                    value.push(chars.next().unwrap());
+                }
+                if matches!(chars.peek(), Some('.')) {
+                    value.push(chars.next().unwrap());
+                    if !matches!(chars.peek(), Some(next) if next.is_ascii_digit()) {
+                        return Err("Expected digits after decimal point".to_string());
+                    }
+                    while matches!(chars.peek(), Some(ch) if ch.is_ascii_digit()) {
+                        value.push(chars.next().unwrap());
+                    }
+                }
+                if matches!(chars.peek(), Some('e' | 'E')) {
+                    value.push(chars.next().unwrap());
+                    if matches!(chars.peek(), Some('+' | '-')) {
+                        value.push(chars.next().unwrap());
+                    }
+                    if !matches!(chars.peek(), Some(next) if next.is_ascii_digit()) {
+                        return Err("Expected exponent digits".to_string());
+                    }
+                    while matches!(chars.peek(), Some(ch) if ch.is_ascii_digit()) {
+                        value.push(chars.next().unwrap());
                     }
                 }
 
@@ -216,6 +248,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, String> {
 
                     "true" => tokens.push(Token::Boolean(true)),
                     "false" => tokens.push(Token::Boolean(false)),
+                    "null" => tokens.push(Token::Null),
 
                     _ => tokens.push(Token::Identifier(word)),
                 }

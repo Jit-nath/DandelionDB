@@ -56,6 +56,7 @@ pub enum Token {
     String(String),
     Number(String),
     Boolean(bool),
+    Null,
     Variable(String),
 
     // Symbols

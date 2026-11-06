@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::catalog::{Catalog, Collection, Field, Schema};
@@ -10,6 +10,9 @@ use crate::dql::validator::validate;
 
 use crate::storage::header::{HEADER_VERSION_MAJOR, HEADER_VERSION_MINOR, Header};
 use crate::storage::helpers::validate_create_path;
+use crate::storage::mutation::DataMutationProcess;
+use crate::storage::reader::SegmentReader;
+use crate::storage::scheduler::{ReservationKind, StorageScheduler};
 use crate::storage::segment_index::{SegmentIndex, SegmentIndexEntry};
 
 use crate::dql::ast::Value;
@@ -21,7 +24,8 @@ const SCHEMA_SEGMENT_MAGIC: &[u8; 8] = b"DNSCH001";
 const SCHEMA_SEGMENT_HEADER_SIZE: u64 = 16;
 const SCHEMA_SEGMENT_CAPACITY: u64 = 1024 * 1024;
 const SCHEMA_DATA_TYPE: u8 = 0x00;
-const DATA_MAGIC: &[u8; 8] = b"DNDAT001";
+const TABLE_DATA_TYPE: u8 = 0x01;
+const VECTOR_DATA_TYPE: u8 = 0x02;
 
 #[derive(Debug, Clone)]
 pub(crate) struct StoredRow {
@@ -38,6 +42,8 @@ pub struct Database {
     pub(crate) catalog: Catalog,
     pub header: Header,
     pub segment_index: SegmentIndex,
+    segment_reader: SegmentReader,
+    mutations: DataMutationProcess,
     pub(crate) rows: HashMap<String, Vec<StoredRow>>,
     pub(crate) indexes: HashSet<(String, String)>,
     pub(crate) next_row_id: u64,
@@ -66,6 +72,7 @@ impl Database {
         // 4. Write initial file structure
         header.write_to(&mut file)?;
         segment_index.initialize(&mut file)?;
+        let segment_reader = SegmentReader::load(&mut file, &segment_index)?;
 
         // 5. Make initial state durable
         file.sync_all()?;
@@ -76,6 +83,8 @@ impl Database {
             path: path.to_path_buf(),
             header,
             segment_index,
+            segment_reader,
+            mutations: DataMutationProcess::default(),
             catalog: Catalog::new(),
             rows: HashMap::new(),
             indexes: HashSet::new(),
@@ -113,6 +122,8 @@ impl Database {
 
         // 4. Reconstruct segment index
         let segment_index = SegmentIndex::new();
+        let segment_reader = SegmentReader::load(&mut file, &segment_index)
+            .map_err(|_| DatabaseError::InvalidDatabase)?;
 
         // 5. Construct in-memory database
         let mut database = Self {
@@ -120,6 +131,8 @@ impl Database {
             path: path.to_path_buf(),
             header,
             segment_index,
+            segment_reader,
+            mutations: DataMutationProcess::default(),
             catalog: Catalog::new(),
             rows: HashMap::new(),
             indexes: HashSet::new(),
@@ -173,13 +186,24 @@ impl Database {
         self.rows.entry(collection.to_string()).or_default()
     }
 
+    pub fn live_record_count(&self, collection: &str) -> usize {
+        self.mutations.live_count(collection)
+    }
+
+    pub fn is_live_record(&self, collection: &str, id: u64) -> bool {
+        self.mutations.is_live(collection, id)
+    }
+
+    pub fn live_record_ids(&self, collection: &str) -> impl Iterator<Item = u64> + '_ {
+        self.mutations.live_ids(collection)
+    }
+
+    pub(crate) fn forget_live_records(&mut self, collection: &str) {
+        self.mutations.forget_collection(collection);
+    }
+
     pub(crate) fn append_data_record(&mut self, payload: &[u8]) -> Result<(), DatabaseError> {
-        let offset = self.file.seek(SeekFrom::End(0))?;
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(DATA_MAGIC)?;
-        self.file.write_all(&(payload.len() as u32).to_le_bytes())?;
-        self.file.write_all(payload)?;
-        self.file.sync_all()?;
+        self.mutations.append(&mut self.file, payload)?;
         Ok(())
     }
 
@@ -192,7 +216,9 @@ impl Database {
         encode_string(&mut payload, collection)?;
         payload.extend_from_slice(&row.id.to_le_bytes());
         encode_values(&mut payload, &row.values)?;
-        self.append_data_record(&payload)
+        self.append_data_record(&payload)?;
+        self.mutations.record_insert(collection, row.id);
+        Ok(())
     }
 
     pub(crate) fn append_row_update(
@@ -215,7 +241,9 @@ impl Database {
         let mut payload = vec![3u8];
         encode_string(&mut payload, collection)?;
         payload.extend_from_slice(&id.to_le_bytes());
-        self.append_data_record(&payload)
+        self.append_data_record(&payload)?;
+        self.mutations.record_delete(collection, id);
+        Ok(())
     }
 
     pub(crate) fn append_index_record(
@@ -237,31 +265,12 @@ impl Database {
     }
 
     fn load_data_log(&mut self) -> Result<(), DatabaseError> {
-        let start = self
-            .segment_index
-            .read_entries(&mut self.file)?
-            .iter()
-            .filter(|e| e.segment_id != 0)
-            .map(|e| e.offset.saturating_add(e.total_size))
-            .max()
-            .unwrap_or(crate::storage::segment_index::HEADER_SIZE + self.segment_index.size());
-        let end = self.file.metadata()?.len();
-        let mut cursor = start;
-        while cursor + 12 <= end {
-            self.file.seek(SeekFrom::Start(cursor))?;
-            let mut magic = [0u8; 8];
-            self.file.read_exact(&mut magic)?;
-            if &magic != DATA_MAGIC {
-                break;
-            }
-            let length = read_u32(&mut self.file)? as u64;
-            if length > end.saturating_sub(cursor + 12) {
-                return Err(DatabaseError::InvalidDatabase);
-            }
-            let mut payload = vec![0u8; length as usize];
-            self.file.read_exact(&mut payload)?;
+        for payload in self
+            .segment_reader
+            .read_data_records(&mut self.file, &self.segment_index)
+            .map_err(|_| DatabaseError::InvalidDatabase)?
+        {
             self.apply_data_record(&payload)?;
-            cursor += 12 + length;
         }
         Ok(())
     }
@@ -275,7 +284,7 @@ impl Database {
                 let id =
                     u64::from_le_bytes(take_bytes(payload, &mut cursor, 8)?.try_into().unwrap());
                 let values = decode_values(payload, &mut cursor)?;
-                let rows = self.rows.entry(collection).or_default();
+                let rows = self.rows.entry(collection.clone()).or_default();
                 if let Some(row) = rows.iter_mut().find(|row| row.id == id) {
                     row.values = values;
                     row.deleted = false;
@@ -287,19 +296,21 @@ impl Database {
                     });
                 }
                 self.next_row_id = self.next_row_id.max(id.saturating_add(1));
+                self.mutations.record_insert(&collection, id);
             }
             3 => {
                 let id =
                     u64::from_le_bytes(take_bytes(payload, &mut cursor, 8)?.try_into().unwrap());
                 if let Some(row) = self
                     .rows
-                    .entry(collection)
+                    .entry(collection.clone())
                     .or_default()
                     .iter_mut()
                     .find(|row| row.id == id)
                 {
                     row.deleted = true;
                 }
+                self.mutations.record_delete(&collection, id);
             }
             4 => {
                 let field = decode_string(payload, &mut cursor)?;
@@ -315,6 +326,7 @@ impl Database {
                     .map_err(|_| DatabaseError::InvalidDatabase)?;
                 self.rows.remove(&collection);
                 self.indexes.retain(|(name, _)| name != &collection);
+                self.mutations.forget_collection(&collection);
             }
             _ => return Err(DatabaseError::InvalidDatabase),
         }
@@ -351,7 +363,67 @@ impl Database {
         entry.data_type_flags = (SCHEMA_DATA_TYPE << 4) | flags;
         self.segment_index
             .write_entry(&mut self.file, index, &entry)?;
+        self.reserve_collection_storage(collection)?;
+        self.segment_reader
+            .refresh(&mut self.file, &self.segment_index)?;
         self.file.sync_all()?;
+        Ok(())
+    }
+
+    /// Creates table and vector extents while the schema is created.  The
+    /// scheduler's default forecast is 1,000 rows and every extent is a
+    /// binary 1..256 MiB reservation.
+    fn reserve_collection_storage(&mut self, collection: &Collection) -> Result<(), DatabaseError> {
+        let scheduler = StorageScheduler::default();
+        for reservation in scheduler.plan_collection(collection.schema()) {
+            let data_type = match reservation.kind {
+                ReservationKind::Schema => SCHEMA_DATA_TYPE,
+                ReservationKind::Table => TABLE_DATA_TYPE,
+                ReservationKind::Vector => VECTOR_DATA_TYPE,
+            };
+            self.allocate_reserved_segment(
+                reservation.bytes,
+                data_type,
+                collection.table_number(),
+                reservation.column_number,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn allocate_reserved_segment(
+        &mut self,
+        bytes: u64,
+        data_type: u8,
+        table_number: u16,
+        column_number: u8,
+    ) -> Result<(), DatabaseError> {
+        let entries = self.segment_index.read_entries(&mut self.file)?;
+        let (index, _) = entries
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| entry.segment_id == 0)
+            .ok_or_else(|| DatabaseError::Io(std::io::Error::other("segment index is full")))?;
+        let index = u32::try_from(index).map_err(|_| DatabaseError::InvalidDatabase)?;
+        let next_segment_id = entries
+            .iter()
+            .map(|entry| entry.segment_id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let offset = self.file.metadata()?.len();
+        let entry = SegmentIndexEntry::new(
+            next_segment_id,
+            offset,
+            bytes,
+            data_type << 4,
+            table_number,
+            column_number,
+            0,
+        );
+        self.file.set_len(offset.saturating_add(bytes))?;
+        self.segment_index
+            .write_entry(&mut self.file, index, &entry)?;
         Ok(())
     }
 
@@ -420,13 +492,15 @@ impl Database {
     }
 
     fn read_schema_used(&mut self, offset: u64) -> Result<u64, DatabaseError> {
-        let mut magic = [0u8; 8];
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.read_exact(&mut magic)?;
-        if &magic != SCHEMA_SEGMENT_MAGIC {
+        let header = self.segment_reader.read_range(
+            &mut self.file,
+            offset,
+            SCHEMA_SEGMENT_HEADER_SIZE as usize,
+        )?;
+        if &header[..8] != SCHEMA_SEGMENT_MAGIC {
             return Err(DatabaseError::InvalidDatabase);
         }
-        let used = read_u64(&mut self.file)?;
+        let used = u64::from_le_bytes(header[8..16].try_into().unwrap());
         if !(SCHEMA_SEGMENT_HEADER_SIZE..=SCHEMA_SEGMENT_CAPACITY).contains(&used) {
             return Err(DatabaseError::InvalidDatabase);
         }
@@ -434,18 +508,20 @@ impl Database {
     }
 
     fn load_catalog(&mut self) -> Result<(), DatabaseError> {
-        for (_, entry) in self
-            .segment_index
-            .read_entries(&mut self.file)?
-            .into_iter()
-            .enumerate()
-        {
-            if entry.segment_id == 0 || entry.data_type() != SCHEMA_DATA_TYPE {
-                continue;
-            }
+        let schema_segments: Vec<_> = self
+            .segment_reader
+            .entries()
+            .iter()
+            .copied()
+            .filter(|entry| entry.data_type() == SCHEMA_DATA_TYPE)
+            .collect();
+        for entry in schema_segments {
             let used = self.read_schema_used(entry.offset)?;
-            let mut bytes = vec![0u8; (used - SCHEMA_SEGMENT_HEADER_SIZE) as usize];
-            self.file.read_exact(&mut bytes)?;
+            let bytes = self.segment_reader.read_range(
+                &mut self.file,
+                entry.offset + SCHEMA_SEGMENT_HEADER_SIZE,
+                (used - SCHEMA_SEGMENT_HEADER_SIZE) as usize,
+            )?;
             let mut cursor = 0usize;
             while cursor < bytes.len() {
                 let (collection, consumed) = decode_collection(&bytes[cursor..])?;
@@ -659,18 +735,6 @@ fn take_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, DatabaseError> {
         take_bytes(bytes, cursor, 4)?.try_into().unwrap(),
     ))
 }
-fn read_u64(reader: &mut File) -> std::io::Result<u64> {
-    let mut bytes = [0u8; 8];
-    reader.read_exact(&mut bytes)?;
-    Ok(u64::from_le_bytes(bytes))
-}
-
-fn read_u32(reader: &mut File) -> std::io::Result<u32> {
-    let mut bytes = [0u8; 4];
-    reader.read_exact(&mut bytes)?;
-    Ok(u32::from_le_bytes(bytes))
-}
-
 fn encode_string(bytes: &mut Vec<u8>, value: &str) -> Result<(), DatabaseError> {
     let value = value.as_bytes();
     let len = u32::try_from(value.len())
@@ -688,6 +752,7 @@ fn decode_string(bytes: &[u8], cursor: &mut usize) -> Result<String, DatabaseErr
 
 fn encode_value(bytes: &mut Vec<u8>, value: &Value) -> Result<(), DatabaseError> {
     match value {
+        Value::Null => bytes.push(0),
         Value::String(value) => {
             bytes.push(1);
             encode_string(bytes, value)?;
@@ -718,6 +783,7 @@ fn encode_value(bytes: &mut Vec<u8>, value: &Value) -> Result<(), DatabaseError>
 fn decode_value(bytes: &[u8], cursor: &mut usize) -> Result<Value, DatabaseError> {
     let tag = take_bytes(bytes, cursor, 1)?[0];
     Ok(match tag {
+        0 => Value::Null,
         1 => Value::String(decode_string(bytes, cursor)?),
         2 => Value::Number(decode_string(bytes, cursor)?),
         3 => Value::Boolean(take_bytes(bytes, cursor, 1)?[0] != 0),
@@ -761,7 +827,7 @@ fn decode_values(
 
 #[cfg(test)]
 mod tests {
-    use super::Database;
+    use super::{Database, TABLE_DATA_TYPE, VECTOR_DATA_TYPE};
     use crate::result::QueryResult;
 
     fn test_path(name: &str) -> std::path::PathBuf {
@@ -837,6 +903,39 @@ mod tests {
     }
 
     #[test]
+    fn creating_collection_reserves_table_and_vector_segments() {
+        let path = test_path("reservations");
+        let _ = std::fs::remove_file(&path);
+        let mut db = Database::create(&path).expect("database should be created");
+        db.execute(
+            r#"create collection "docs" {
+                "id" uint64 primary auto_increment,
+                "embedding" vector<fp32, 768> metric cosine,
+            };"#,
+        )
+        .expect("collection should be created");
+
+        let entries = db
+            .segment_index
+            .read_entries(&mut db.file)
+            .expect("segment index should be readable");
+        assert!(entries.iter().any(|entry| {
+            entry.data_type() == TABLE_DATA_TYPE
+                && entry.table_number == 1
+                && entry.total_size == 1024 * 1024
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry.data_type() == VECTOR_DATA_TYPE
+                && entry.table_number == 1
+                && entry.column_number == 2
+                && entry.total_size == 4 * 1024 * 1024
+        }));
+
+        db.close().expect("database should close");
+        std::fs::remove_file(path).expect("test database should be removed");
+    }
+
+    #[test]
     fn crud_search_and_index_round_trip() {
         let path = test_path("operations");
         let _ = std::fs::remove_file(&path);
@@ -905,9 +1004,13 @@ mod tests {
 
         db.execute(r#"create index on "items" ("embedding") using flat;"#)
             .expect("index should work");
+        assert_eq!(db.live_record_ids("items").collect::<Vec<_>>(), vec![1]);
+        assert_eq!(db.live_record_count("items"), 1);
         db.close().expect("database should close");
 
         let mut reopened = Database::open(&path).expect("database should reopen");
+        assert!(reopened.is_live_record("items", 1));
+        assert!(!reopened.is_live_record("items", 2));
         let found = reopened
             .execute(r#"find top 5 near [0, 0] on "items" ("embedding") return "name";"#)
             .expect("search after reopen should work");

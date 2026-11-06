@@ -49,6 +49,10 @@ impl Parser {
 
     fn parse_value(&mut self) -> Result<Value, String> {
         match self.current() {
+            Token::Null => {
+                self.advance();
+                Ok(Value::Null)
+            }
             Token::String(value) => {
                 let value = value.clone();
                 self.advance();

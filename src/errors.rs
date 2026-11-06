@@ -1,5 +1,5 @@
-use std::io;
 use std::fmt;
+use std::io;
 
 #[derive(Debug)]
 pub enum DatabaseError {
@@ -34,7 +34,9 @@ impl fmt::Display for DatabaseError {
             Self::Parser(error) => write!(formatter, "parser error: {error}"),
             Self::Validation(error) => write!(formatter, "validation error: {error}"),
             Self::Catalog(error) => write!(formatter, "catalog error: {error}"),
-            Self::UnsupportedOperation(operation) => write!(formatter, "unsupported operation: {operation}"),
+            Self::UnsupportedOperation(operation) => {
+                write!(formatter, "unsupported operation: {operation}")
+            }
             Self::InvalidDatabasePath => write!(formatter, "invalid database path"),
             Self::ParentDirectoryNotFound => write!(formatter, "parent directory not found"),
             Self::DatabaseAlreadyExists => write!(formatter, "database already exists"),

@@ -31,6 +31,7 @@ pub fn execute_statement(
                 .drop_collection(&stmt.name)
                 .map_err(|err| DatabaseError::Catalog(format!("{err:?}")))?;
             db.rows.remove(&stmt.name);
+            db.forget_live_records(&stmt.name);
             Ok(QueryResult::Empty)
         }
 
@@ -40,9 +41,22 @@ pub fn execute_statement(
                 .get_collection(&stmt.collection)
                 .map_err(|e| DatabaseError::Catalog(format!("{e:?}")))?;
             for field in &stmt.fields {
-                if !collection.schema().has_field(field) {
+                let field_definition = collection
+                    .schema()
+                    .get_field(field)
+                    .ok_or_else(|| DatabaseError::Validation(format!("Unknown field '{field}'")))?;
+                if !matches!(field_definition.data_type, DataType::Vector(_)) {
                     return Err(DatabaseError::Validation(format!(
-                        "Unknown field '{field}'"
+                        "Index field '{field}' must be a vector field"
+                    )));
+                }
+                if db
+                    .indexes
+                    .contains(&(stmt.collection.clone(), field.clone()))
+                {
+                    return Err(DatabaseError::Validation(format!(
+                        "An index already exists on '{}.{}'",
+                        stmt.collection, field
                     )));
                 }
             }
@@ -112,13 +126,22 @@ fn insert(db: &mut Database, stmt: &crate::dql::ast::Insert) -> Result<QueryResu
         .fields()
         .iter()
         .find(|f| f.primary_key && f.auto_increment);
+    let row_id = db
+        .rows(&stmt.collection)
+        .iter()
+        .map(|row| row.id)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| DatabaseError::Validation("Row ID space exhausted".into()))?;
     if let Some(field) = id_field {
-        if !values.contains_key(&field.name) {
-            values.insert(
-                field.name.clone(),
-                Value::Number(db.next_row_id.to_string()),
-            );
+        if values.contains_key(&field.name) {
+            return Err(DatabaseError::Validation(format!(
+                "auto_increment field '{}' must be omitted",
+                field.name
+            )));
         }
+        values.insert(field.name.clone(), Value::Number(row_id.to_string()));
     }
     for field in collection.schema().fields() {
         if !field.nullable
@@ -131,12 +154,34 @@ fn insert(db: &mut Database, stmt: &crate::dql::ast::Insert) -> Result<QueryResu
             )));
         }
     }
+    for field in collection
+        .schema()
+        .fields()
+        .iter()
+        .filter(|field| field.primary_key)
+    {
+        let candidate = values
+            .get(&field.name)
+            .expect("primary key is non-nullable");
+        if db.rows(&stmt.collection).iter().any(|row| {
+            db.is_live_record(&stmt.collection, row.id)
+                && row
+                    .values
+                    .get(&field.name)
+                    .is_some_and(|value| value == candidate)
+        }) {
+            return Err(DatabaseError::Validation(format!(
+                "Duplicate primary key '{}'",
+                field.name
+            )));
+        }
+    }
     let row = crate::engine::StoredRow {
-        id: db.next_row_id,
+        id: row_id,
         values,
         deleted: false,
     };
-    db.next_row_id = db.next_row_id.saturating_add(1);
+    db.next_row_id = db.next_row_id.max(row_id.saturating_add(1));
     db.append_row_insert(&stmt.collection, &row)?;
     db.rows_mut(&stmt.collection).push(row.clone());
     Ok(QueryResult::Affected {
@@ -155,10 +200,17 @@ fn update(db: &mut Database, stmt: &crate::dql::ast::Update) -> Result<QueryResu
         .schema()
         .get_field(&stmt.field)
         .ok_or_else(|| DatabaseError::Validation(format!("Unknown field '{}'", stmt.field)))?;
+    if field.primary_key {
+        return Err(DatabaseError::Validation(
+            "Primary-key fields are immutable".into(),
+        ));
+    }
     validate_value(field, &stmt.value)?;
+    validate_filter_fields(&stmt.filter, &collection)?;
     let mut changed = Vec::new();
     for row in db.rows(&stmt.collection) {
-        if !row.deleted && matches_filter(&stmt.filter, &row.values)? {
+        if db.is_live_record(&stmt.collection, row.id) && matches_filter(&stmt.filter, &row.values)?
+        {
             changed.push(row.id);
         }
     }
@@ -192,12 +244,19 @@ fn update(db: &mut Database, stmt: &crate::dql::ast::Update) -> Result<QueryResu
 }
 
 fn delete(db: &mut Database, stmt: &crate::dql::ast::Delete) -> Result<QueryResult, DatabaseError> {
-    let ids: Vec<u64> = db
-        .rows(&stmt.collection)
-        .iter()
-        .filter(|r| !r.deleted && matches_filter(&stmt.filter, &r.values).unwrap_or(false))
-        .map(|r| r.id)
-        .collect();
+    let collection = db
+        .catalog()
+        .get_collection(&stmt.collection)
+        .map_err(|e| DatabaseError::Catalog(format!("{e:?}")))?
+        .clone();
+    validate_filter_fields(&stmt.filter, &collection)?;
+    let mut ids = Vec::new();
+    for row in db.rows(&stmt.collection) {
+        if db.is_live_record(&stmt.collection, row.id) && matches_filter(&stmt.filter, &row.values)?
+        {
+            ids.push(row.id);
+        }
+    }
     for id in &ids {
         db.append_row_delete(&stmt.collection, *id)?;
     }
@@ -230,6 +289,15 @@ fn find(db: &mut Database, stmt: &crate::dql::ast::Find) -> Result<QueryResult, 
             ));
         }
     };
+    if let Some(search) = &stmt.search {
+        return Err(DatabaseError::Validation(format!(
+            "Search property '{}' requires an implemented ANN index",
+            search.property
+        )));
+    }
+    if let Some(filter) = &stmt.filter {
+        validate_filter_fields(filter, &collection)?;
+    }
     let query = match &stmt.vector {
         VectorExpr::Literal(values) => values
             .iter()
@@ -250,7 +318,11 @@ fn find(db: &mut Database, stmt: &crate::dql::ast::Find) -> Result<QueryResult, 
         ));
     }
     let mut ranked = Vec::new();
-    for row in db.rows(&stmt.collection).iter().filter(|r| !r.deleted) {
+    for row in db
+        .rows(&stmt.collection)
+        .iter()
+        .filter(|row| db.is_live_record(&stmt.collection, row.id))
+    {
         if let Some(filter) = &stmt.filter {
             if !matches_filter(filter, &row.values)? {
                 continue;
@@ -273,17 +345,27 @@ fn find(db: &mut Database, stmt: &crate::dql::ast::Find) -> Result<QueryResult, 
             DistanceMetric::DotProduct => dot_product(&query, &numbers),
         };
         if let Some(within) = &stmt.top.within {
-            if score
-                > within
-                    .parse::<f64>()
-                    .map_err(|_| DatabaseError::Validation("Invalid within value".into()))?
-            {
+            let threshold = within
+                .parse::<f64>()
+                .map_err(|_| DatabaseError::Validation("Invalid within value".into()))?;
+            let outside = match vector_type.metric {
+                DistanceMetric::DotProduct => score < threshold,
+                DistanceMetric::Cosine | DistanceMetric::Euclidean => score > threshold,
+            };
+            if outside {
                 continue;
             }
         }
         ranked.push((score, row));
     }
-    ranked.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+    ranked.sort_by(|a, b| {
+        let order = match vector_type.metric {
+            DistanceMetric::DotProduct => b.0.partial_cmp(&a.0),
+            DistanceMetric::Cosine | DistanceMetric::Euclidean => a.0.partial_cmp(&b.0),
+        }
+        .unwrap_or(Ordering::Equal);
+        order.then_with(|| a.1.id.cmp(&b.1.id))
+    });
     ranked.truncate(stmt.top.limit as usize);
     let columns = stmt
         .return_fields
@@ -310,11 +392,9 @@ fn find(db: &mut Database, stmt: &crate::dql::ast::Find) -> Result<QueryResult, 
                 .return_fields
                 .iter()
                 .map(|field| match field {
-                    ReturnField::Field(name) => row
-                        .values
-                        .get(name)
-                        .cloned()
-                        .unwrap_or(Value::String("".into())),
+                    ReturnField::Field(name) => {
+                        row.values.get(name).cloned().unwrap_or(Value::Null)
+                    }
                     ReturnField::Score => Value::Number(score.to_string()),
                 })
                 .collect(),
@@ -325,21 +405,39 @@ fn find(db: &mut Database, stmt: &crate::dql::ast::Find) -> Result<QueryResult, 
 
 fn validate_value(field: &Field, value: &Value) -> Result<(), DatabaseError> {
     match (&field.data_type, value) {
+        (_, Value::Null) if field.nullable => Ok(()),
+        (_, Value::Null) => Err(DatabaseError::Validation(format!(
+            "Field '{}' is not nullable",
+            field.name
+        ))),
         (DataType::Scalar(ScalarType::Text), Value::String(_))
-        | (DataType::Scalar(ScalarType::Bytes), Value::String(_))
         | (DataType::Scalar(ScalarType::Boolean), Value::Boolean(_)) => Ok(()),
-        (DataType::Scalar(_), Value::Number(value)) => value
-            .parse::<f64>()
-            .map(|_| ())
-            .map_err(|_| DatabaseError::Validation(format!("Invalid value for '{}'", field.name))),
+        (DataType::Scalar(ScalarType::Bytes), Value::String(value)) if is_base64_value(value) => {
+            Ok(())
+        }
+        (DataType::Scalar(ScalarType::DateTime), Value::String(value)) if is_rfc3339_utc(value) => {
+            Ok(())
+        }
+        (DataType::Scalar(scalar), Value::Number(value)) => {
+            validate_numeric(*scalar, value, &field.name)
+        }
         (DataType::Vector(vector), Value::Vector(values))
             if values.len() == vector.dimension as usize =>
         {
-            values.iter().try_for_each(|v| {
-                v.parse::<f64>()
-                    .map(|_| ())
-                    .map_err(|_| DatabaseError::Validation("Invalid vector value".into()))
-            })
+            let mut norm_squared = 0.0;
+            for value in values {
+                validate_vector_element(vector.element_type, value)?;
+                let number = value
+                    .parse::<f64>()
+                    .map_err(|_| DatabaseError::Validation("Invalid vector value".into()))?;
+                norm_squared += number * number;
+            }
+            if matches!(vector.metric, DistanceMetric::Cosine) && norm_squared == 0.0 {
+                return Err(DatabaseError::Validation(
+                    "Cosine vectors must have non-zero norm".into(),
+                ));
+            }
+            Ok(())
         }
         _ => Err(DatabaseError::Validation(format!(
             "Type mismatch for field '{}'",
@@ -372,6 +470,11 @@ fn compare(
         return Ok(false);
     };
     let ordering = match (left, right) {
+        (Value::Null, _) | (_, Value::Null) => {
+            return Err(DatabaseError::Validation(
+                "Null comparisons are not supported".into(),
+            ));
+        }
         (Value::Number(a), Value::Number(b)) => {
             let a = a
                 .parse::<f64>()
@@ -397,7 +500,7 @@ fn compare(
 }
 
 fn cosine(a: &[f64], b: &[f64]) -> f64 {
-    let dot = dot_product(a, b);
+    let dot = raw_dot_product(a, b);
     let na = a.iter().map(|v| v * v).sum::<f64>().sqrt();
     let nb = b.iter().map(|v| v * v).sum::<f64>().sqrt();
     if na == 0.0 || nb == 0.0 {
@@ -414,7 +517,131 @@ fn euclidean(a: &[f64], b: &[f64]) -> f64 {
         .sqrt()
 }
 fn dot_product(a: &[f64], b: &[f64]) -> f64 {
-    1.0 - a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>()
+    raw_dot_product(a, b)
+}
+
+fn raw_dot_product(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+fn validate_filter_fields(
+    filter: &FilterExpr,
+    collection: &crate::catalog::Collection,
+) -> Result<(), DatabaseError> {
+    match filter {
+        FilterExpr::Comparison { field, .. } => {
+            if collection.schema().has_field(field) {
+                Ok(())
+            } else {
+                Err(DatabaseError::Validation(format!(
+                    "Unknown filter field '{field}'"
+                )))
+            }
+        }
+        FilterExpr::And(left, right) | FilterExpr::Or(left, right) => {
+            validate_filter_fields(left, collection)?;
+            validate_filter_fields(right, collection)
+        }
+    }
+}
+
+fn validate_numeric(
+    scalar: ScalarType,
+    value: &str,
+    field_name: &str,
+) -> Result<(), DatabaseError> {
+    let invalid = || DatabaseError::Validation(format!("Invalid value for '{field_name}'"));
+    match scalar {
+        ScalarType::UInt8 => value.parse::<u8>().map(|_| ()).map_err(|_| invalid()),
+        ScalarType::UInt16 => value.parse::<u16>().map(|_| ()).map_err(|_| invalid()),
+        ScalarType::UInt32 => value.parse::<u32>().map(|_| ()).map_err(|_| invalid()),
+        ScalarType::UInt64 => value.parse::<u64>().map(|_| ()).map_err(|_| invalid()),
+        ScalarType::Int8 => value.parse::<i8>().map(|_| ()).map_err(|_| invalid()),
+        ScalarType::Int16 => value.parse::<i16>().map(|_| ()).map_err(|_| invalid()),
+        ScalarType::Int32 => value.parse::<i32>().map(|_| ()).map_err(|_| invalid()),
+        ScalarType::Int64 => value.parse::<i64>().map(|_| ()).map_err(|_| invalid()),
+        ScalarType::Float16 => value
+            .parse::<f32>()
+            .ok()
+            .filter(|v| v.is_finite() && v.abs() <= 65_504.0)
+            .map(|_| ())
+            .ok_or_else(invalid),
+        ScalarType::Float32 => value
+            .parse::<f32>()
+            .ok()
+            .filter(|v| v.is_finite())
+            .map(|_| ())
+            .ok_or_else(invalid),
+        ScalarType::Float64 | ScalarType::Float128 => value
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite())
+            .map(|_| ())
+            .ok_or_else(invalid),
+        ScalarType::Boolean | ScalarType::Text | ScalarType::Bytes | ScalarType::DateTime => {
+            Err(invalid())
+        }
+    }
+}
+
+fn validate_vector_element(
+    element_type: VectorElementType,
+    value: &str,
+) -> Result<(), DatabaseError> {
+    let invalid = || DatabaseError::Validation("Invalid vector element value".into());
+    match element_type {
+        VectorElementType::Binary => match value {
+            "0" | "1" => Ok(()),
+            _ => Err(invalid()),
+        },
+        VectorElementType::Int4 => value
+            .parse::<i8>()
+            .ok()
+            .filter(|value| (-8..=7).contains(value))
+            .map(|_| ())
+            .ok_or_else(invalid),
+        VectorElementType::Int8 => value.parse::<i8>().map(|_| ()).map_err(|_| invalid()),
+        VectorElementType::Int16 => value.parse::<i16>().map(|_| ()).map_err(|_| invalid()),
+        VectorElementType::FP16 => value
+            .parse::<f32>()
+            .ok()
+            .filter(|value| value.is_finite() && value.abs() <= 65_504.0)
+            .map(|_| ())
+            .ok_or_else(invalid),
+        VectorElementType::FP32 => value
+            .parse::<f32>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .map(|_| ())
+            .ok_or_else(invalid),
+        VectorElementType::FP64 => value
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite())
+            .map(|_| ())
+            .ok_or_else(invalid),
+    }
+}
+
+fn is_rfc3339_utc(value: &str) -> bool {
+    value.len() >= 20
+        && value.ends_with('Z')
+        && value.as_bytes().get(4) == Some(&b'-')
+        && value.as_bytes().get(7) == Some(&b'-')
+        && value.as_bytes().get(10) == Some(&b'T')
+        && value.as_bytes().get(13) == Some(&b':')
+        && value.as_bytes().get(16) == Some(&b':')
+}
+
+fn is_base64_value(value: &str) -> bool {
+    let Some(encoded) = value.strip_prefix("base64:") else {
+        return false;
+    };
+    !encoded.is_empty()
+        && encoded.len() % 4 == 0
+        && encoded
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '='))
 }
 
 fn create_collection(

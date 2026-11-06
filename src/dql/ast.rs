@@ -142,6 +142,7 @@ pub enum ReturnField {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
+    Null,
     String(String),
     Number(String),
     Boolean(bool),
