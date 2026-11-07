@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 pub const MAGIC: &[u8; 11] = b"DANDELIONDB";
 
 pub const HEADER_VERSION_MAJOR: u32 = 0;
-pub const HEADER_VERSION_MINOR: u32 = 2;
+pub const HEADER_VERSION_MINOR: u32 = 3;
 pub const HEADER_VERSION_PATCH: u32 = 0;
 
 pub const CHECKSUM_ENABLED: u8 = 1 << 0;

@@ -32,12 +32,18 @@ impl fmt::Display for DatabaseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "I/O error: {error}\n This should not happen"),
-            Self::Tokenizer(error) => write!(formatter, "tokenizer error: {error}\n You might want to check the syntax"),
+            Self::Tokenizer(error) => write!(
+                formatter,
+                "tokenizer error: {error}\n You might want to check the syntax"
+            ),
             Self::Parser(error) => write!(formatter, "parser error: {error}"),
             Self::Validation(error) => write!(formatter, "validation error: {error}"),
             Self::Catalog(error) => write!(formatter, "catalog error: {error}"),
             Self::UnsupportedOperation(operation) => {
-                write!(formatter, "unsupported operation: {operation}\nAre you trying to test what's possible??")
+                write!(
+                    formatter,
+                    "unsupported operation: {operation}\nAre you trying to test what's possible??"
+                )
             }
             Self::InvalidDatabasePath => write!(formatter, "invalid database path"),
             Self::ParentDirectoryNotFound => write!(formatter, "parent directory not found"),

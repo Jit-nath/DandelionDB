@@ -5,10 +5,6 @@
 //! the active record set separate from the immutable log.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
-use std::io::{self, Seek, SeekFrom, Write};
-
-use super::reader::DATA_RECORD_MAGIC;
 
 #[derive(Debug, Default)]
 pub struct DataMutationProcess {
@@ -16,22 +12,6 @@ pub struct DataMutationProcess {
 }
 
 impl DataMutationProcess {
-    /// Appends one fully encoded operation. It deliberately does not attempt
-    /// to reuse free space left by deleted records.
-    pub fn append(&self, file: &mut File, payload: &[u8]) -> io::Result<()> {
-        self.append_unsynced(file, payload)?;
-        file.sync_all()
-    }
-
-    pub fn append_unsynced(&self, file: &mut File, payload: &[u8]) -> io::Result<()> {
-        let length = u32::try_from(payload.len())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "data record is too large"))?;
-        file.seek(SeekFrom::End(0))?;
-        file.write_all(DATA_RECORD_MAGIC)?;
-        file.write_all(&length.to_le_bytes())?;
-        file.write_all(payload)
-    }
-
     pub fn record_insert(&mut self, collection: &str, id: u64) {
         self.live_records
             .entry(collection.to_owned())

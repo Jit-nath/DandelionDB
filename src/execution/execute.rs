@@ -5,7 +5,9 @@
 //! statement and focus on catalog checks, row mutation, indexing, and results.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::BinaryHeap;
+use std::collections::HashSet;
+use std::thread;
 
 use crate::catalog::schema::{Field, Schema};
 use crate::dql::ast::{
@@ -34,12 +36,14 @@ pub fn execute_statement(
                     stmt.name
                 )));
             }
-            db.append_collection_drop(&stmt.name)?;
+            db.invalidate_collection_schema(&stmt.name)?;
             db.catalog_mut()
                 .drop_collection(&stmt.name)
                 .map_err(|err| DatabaseError::Catalog(format!("{err:?}")))?;
             db.rows.remove(&stmt.name);
             db.forget_live_records(&stmt.name);
+            db.forget_primary_keys(&stmt.name);
+            db.forget_vector_indexes(&stmt.name);
             Ok(QueryResult::Empty)
         }
 
@@ -73,8 +77,7 @@ pub fn execute_statement(
                 let ef_construction =
                     index_property(&stmt.properties, "ef_construction").unwrap_or(200);
                 let nlist = index_property(&stmt.properties, "nlist").unwrap_or(16);
-                db.append_index_record(
-                    true,
+                db.append_index_segment(
                     &stmt.collection,
                     field,
                     &stmt.index_type,
@@ -104,9 +107,10 @@ pub fn execute_statement(
                     stmt.collection, stmt.field
                 )));
             }
-            db.append_index_record(false, &stmt.collection, &stmt.field, "flat", 16, 200, 16)?;
+            db.drop_index_segment(&stmt.collection, &stmt.field)?;
             db.indexes
                 .remove(&(stmt.collection.clone(), stmt.field.clone()));
+            db.forget_vector_index(&stmt.collection, &stmt.field);
             Ok(QueryResult::Empty)
         }
 
@@ -182,9 +186,10 @@ pub(crate) fn insert_rows_with_index_policy(
     let mut prepared = Vec::with_capacity(rows_to_insert.len());
 
     for row_values in rows_to_insert {
-        let mut values = HashMap::new();
+        let mut values = vec![None; collection.schema().fields().len()];
+        let mut seen_fields = HashSet::with_capacity(row_values.len());
         for field_value in row_values {
-            if values.contains_key(&field_value.field) {
+            if !seen_fields.insert(field_value.field.as_str()) {
                 return Err(DatabaseError::Validation(format!(
                     "Duplicate field '{}'",
                     field_value.field
@@ -197,21 +202,23 @@ pub(crate) fn insert_rows_with_index_policy(
                     DatabaseError::Validation(format!("Unknown field '{}'", field_value.field))
                 })?;
             validate_value(field, &field_value.value)?;
-            values.insert(field_value.field.clone(), field_value.value.clone());
+            values[field.column_number.saturating_sub(1) as usize] =
+                Some(field_value.value.clone());
         }
 
         if let Some(field) = id_field {
-            if values.contains_key(&field.name) {
+            if values[field.column_number.saturating_sub(1) as usize].is_some() {
                 return Err(DatabaseError::Validation(format!(
                     "auto_increment field '{}' must be omitted",
                     field.name
                 )));
             }
-            values.insert(field.name.clone(), Value::Number(next_row_id.to_string()));
+            values[field.column_number.saturating_sub(1) as usize] =
+                Some(Value::Number(next_row_id.to_string()));
         }
         for field in collection.schema().fields() {
             if !(field.nullable
-                || values.contains_key(&field.name)
+                || values[field.column_number.saturating_sub(1) as usize].is_some()
                 || field.primary_key && field.auto_increment)
             {
                 return Err(DatabaseError::Validation(format!(
@@ -237,23 +244,12 @@ pub(crate) fn insert_rows_with_index_policy(
         .iter()
         .filter(|field| field.primary_key)
     {
-        for (index, row) in prepared.iter().enumerate() {
-            let candidate = row
-                .values
-                .get(&field.name)
-                .expect("primary key is non-nullable");
-            if db.rows(collection_name).iter().any(|existing| {
-                db.is_live_record(collection_name, existing.id)
-                    && existing
-                        .values
-                        .get(&field.name)
-                        .is_some_and(|value| value == candidate)
-            }) || prepared[..index].iter().any(|previous| {
-                previous
-                    .values
-                    .get(&field.name)
-                    .is_some_and(|value| value == candidate)
-            }) {
+        let mut batch_keys = HashSet::with_capacity(prepared.len());
+        for row in &prepared {
+            let candidate = row.get(field).expect("primary key is non-nullable");
+            if db.primary_key_exists(collection_name, candidate)
+                || !batch_keys.insert(crate::engine::primary_key_token(candidate))
+            {
                 return Err(DatabaseError::Validation(format!(
                     "Duplicate primary key '{}'",
                     field.name
@@ -265,9 +261,23 @@ pub(crate) fn insert_rows_with_index_policy(
     let last_insert_id = prepared.last().map(|row| Value::Number(row.id.to_string()));
     db.append_row_insert_batch(collection_name, &prepared)?;
     db.next_row_id = db.next_row_id.max(next_row_id);
+    for field in collection
+        .schema()
+        .fields()
+        .iter()
+        .filter(|field| field.primary_key)
+    {
+        for row in &prepared {
+            if let Some(value) = row.get(field) {
+                db.register_primary_key(collection_name, value, row.id);
+            }
+        }
+    }
     db.rows_mut(collection_name).extend(prepared);
     if rebuild_indexes {
         db.rebuild_vector_indexes()?;
+    } else {
+        db.invalidate_vector_indexes(collection_name);
     }
     Ok(QueryResult::Affected {
         rows_affected: rows_to_insert.len() as u64,
@@ -294,11 +304,13 @@ fn update(db: &mut Database, stmt: &crate::dql::ast::Update) -> Result<QueryResu
     validate_filter_fields(&stmt.filter, &collection)?;
     let mut changed = Vec::new();
     for row in db.rows(&stmt.collection) {
-        if db.is_live_record(&stmt.collection, row.id) && matches_filter(&stmt.filter, &row.values)?
+        if db.is_live_record(&stmt.collection, row.id)
+            && matches_filter(&stmt.filter, row, collection.schema())?
         {
             changed.push(row.id);
         }
     }
+    let mut updated_rows = Vec::with_capacity(changed.len());
     for id in &changed {
         let old = db
             .rows(&stmt.collection)
@@ -307,22 +319,27 @@ fn update(db: &mut Database, stmt: &crate::dql::ast::Update) -> Result<QueryResu
             .cloned()
             .unwrap();
         let mut values = old.values;
-        values.insert(stmt.field.clone(), stmt.value.clone());
+        values[field.column_number.saturating_sub(1) as usize] = Some(stmt.value.clone());
         let row = crate::engine::StoredRow {
             id: *id,
             values,
             deleted: false,
         };
-        db.append_row_update(&stmt.collection, &row)?;
-        if let Some(existing) = db
-            .rows_mut(&stmt.collection)
-            .iter_mut()
-            .find(|r| r.id == *id)
-        {
-            *existing = row;
+        updated_rows.push(row.clone());
+    }
+    if !updated_rows.is_empty() {
+        db.append_row_updates(&stmt.collection, &updated_rows)?;
+        for row in updated_rows {
+            if let Some(existing) = db
+                .rows_mut(&stmt.collection)
+                .iter_mut()
+                .find(|existing| existing.id == row.id)
+            {
+                *existing = row;
+            }
         }
     }
-    db.rebuild_vector_indexes()?;
+    db.invalidate_vector_indexes(&stmt.collection);
     Ok(QueryResult::Affected {
         rows_affected: changed.len() as u64,
         last_insert_id: None,
@@ -338,24 +355,78 @@ fn delete(db: &mut Database, stmt: &crate::dql::ast::Delete) -> Result<QueryResu
     validate_filter_fields(&stmt.filter, &collection)?;
     let mut ids = Vec::new();
     for row in db.rows(&stmt.collection) {
-        if db.is_live_record(&stmt.collection, row.id) && matches_filter(&stmt.filter, &row.values)?
+        if db.is_live_record(&stmt.collection, row.id)
+            && matches_filter(&stmt.filter, row, collection.schema())?
         {
             ids.push(row.id);
         }
     }
+    if !ids.is_empty() {
+        db.append_row_deletes(&stmt.collection, &ids)?;
+    }
     for id in &ids {
-        db.append_row_delete(&stmt.collection, *id)?;
+        if let Some(value) = db
+            .rows(&stmt.collection)
+            .iter()
+            .find(|row| row.id == *id)
+            .and_then(|row| {
+                collection
+                    .schema()
+                    .fields()
+                    .iter()
+                    .find(|field| field.primary_key)
+                    .and_then(|field| row.get(field))
+                    .cloned()
+            })
+        {
+            db.unregister_primary_key(&stmt.collection, &value);
+        }
     }
     for row in db.rows_mut(&stmt.collection) {
         if ids.contains(&row.id) {
             row.deleted = true;
         }
     }
-    db.rebuild_vector_indexes()?;
+    db.invalidate_vector_indexes(&stmt.collection);
     Ok(QueryResult::Affected {
         rows_affected: ids.len() as u64,
         last_insert_id: None,
     })
+}
+
+struct RankedCandidate<'a> {
+    score: f64,
+    key: f64,
+    row: &'a crate::engine::StoredRow,
+}
+
+impl RankedCandidate<'_> {
+    fn is_better_than(&self, other: &Self) -> bool {
+        self.key.total_cmp(&other.key).is_lt()
+            || (self.key.total_cmp(&other.key).is_eq() && self.row.id < other.row.id)
+    }
+}
+
+impl PartialEq for RankedCandidate<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.key.total_cmp(&other.key).is_eq() && self.row.id == other.row.id
+    }
+}
+
+impl Eq for RankedCandidate<'_> {}
+
+impl Ord for RankedCandidate<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.key
+            .total_cmp(&other.key)
+            .then_with(|| self.row.id.cmp(&other.row.id))
+    }
+}
+
+impl PartialOrd for RankedCandidate<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 fn find(db: &mut Database, stmt: &crate::dql::ast::Find) -> Result<QueryResult, DatabaseError> {
@@ -398,46 +469,110 @@ fn find(db: &mut Database, stmt: &crate::dql::ast::Find) -> Result<QueryResult, 
         .as_ref()
         .map(|search| search.value as usize)
         .unwrap_or((stmt.top.limit as usize).saturating_mul(8).max(64));
-    let candidate_ids = db
-        .indexes
-        .get(&(stmt.collection.clone(), stmt.column.clone()))
-        .and_then(|index| index.candidates(&query_f32, stmt.top.limit as usize, search_budget));
-    let mut ranked = Vec::new();
+    let candidate_ids = if db.vector_index_is_current(&stmt.collection, &stmt.column) {
+        db.indexes
+            .get(&(stmt.collection.clone(), stmt.column.clone()))
+            .and_then(|index| index.candidates(&query_f32, stmt.top.limit as usize, search_budget))
+    } else {
+        None
+    };
+    let limit = stmt.top.limit as usize;
+    let threshold = stmt
+        .top
+        .within
+        .as_ref()
+        .map(|within| {
+            within
+                .parse::<f64>()
+                .map_err(|_| DatabaseError::Validation("Invalid within value".into()))
+        })
+        .transpose()?;
+    let mut candidate_rows = Vec::new();
     for row in db
         .rows(&stmt.collection)
         .iter()
         .filter(|row| db.is_live_record(&stmt.collection, row.id))
     {
-        if let Some(candidate_ids) = &candidate_ids
-            && !candidate_ids.contains(&row.id)
+        if let Some(ids) = &candidate_ids
+            && !ids.contains(&row.id)
         {
             continue;
         }
         if let Some(filter) = &stmt.filter
-            && !matches_filter(filter, &row.values)?
+            && !matches_filter(filter, row, collection.schema())?
         {
             continue;
         }
-        let value = match row.values.get(&stmt.column) {
-            Some(Value::Vector(v)) => v,
-            _ => continue,
-        };
-        if value.len() != query.len() {
-            continue;
-        }
-        let numbers: Vec<f64> = value.as_slice().iter().map(|v| f64::from(*v)).collect();
-        if numbers.len() != query.len() {
-            continue;
-        }
-        let score = match vector_type.metric {
-            DistanceMetric::Cosine => cosine(&query, &numbers),
-            DistanceMetric::Euclidean => euclidean(&query, &numbers),
-            DistanceMetric::DotProduct => dot_product(&query, &numbers),
-        };
-        if let Some(within) = &stmt.top.within {
-            let threshold = within
-                .parse::<f64>()
-                .map_err(|_| DatabaseError::Validation("Invalid within value".into()))?;
+        candidate_rows.push(row);
+    }
+    let worker_count = thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    let scores = if candidate_rows.len() < 512 || worker_count == 1 {
+        candidate_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                let value = match row.get(vector_field) {
+                    Some(Value::Vector(value)) if value.len() == query.len() => value,
+                    _ => return None,
+                };
+                let score = match vector_type.metric {
+                    DistanceMetric::Cosine => cosine(&query, value.as_slice()),
+                    DistanceMetric::Euclidean => euclidean(&query, value.as_slice()),
+                    DistanceMetric::DotProduct => dot_product(&query, value.as_slice()),
+                };
+                Some((index, score))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        let workers = worker_count.min(candidate_rows.len());
+        let chunk_size = candidate_rows.len().div_ceil(workers);
+        let query_ref = query.as_slice();
+        thread::scope(|scope| {
+            let handles = candidate_rows
+                .chunks(chunk_size)
+                .enumerate()
+                .map(|(chunk_index, chunk)| {
+                    scope.spawn(move || {
+                        let base = chunk_index * chunk_size;
+                        chunk
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(offset, row)| {
+                                let value = match row.get(vector_field) {
+                                    Some(Value::Vector(value))
+                                        if value.len() == query_ref.len() =>
+                                    {
+                                        value
+                                    }
+                                    _ => return None,
+                                };
+                                let score = match vector_type.metric {
+                                    DistanceMetric::Cosine => cosine(query_ref, value.as_slice()),
+                                    DistanceMetric::Euclidean => {
+                                        euclidean(query_ref, value.as_slice())
+                                    }
+                                    DistanceMetric::DotProduct => {
+                                        dot_product(query_ref, value.as_slice())
+                                    }
+                                };
+                                Some((base + offset, score))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().expect("distance worker panicked"))
+                .collect::<Vec<_>>()
+        })
+    };
+    let mut ranked = BinaryHeap::with_capacity(limit.saturating_add(1));
+    for (row_index, score) in scores {
+        let row = candidate_rows[row_index];
+        if let Some(threshold) = threshold {
             let outside = match vector_type.metric {
                 DistanceMetric::DotProduct => score < threshold,
                 DistanceMetric::Cosine | DistanceMetric::Euclidean => score > threshold,
@@ -446,17 +581,32 @@ fn find(db: &mut Database, stmt: &crate::dql::ast::Find) -> Result<QueryResult, 
                 continue;
             }
         }
-        ranked.push((score, row));
+        let candidate = RankedCandidate {
+            score,
+            row,
+            key: match vector_type.metric {
+                DistanceMetric::DotProduct => -score,
+                DistanceMetric::Cosine | DistanceMetric::Euclidean => score,
+            },
+        };
+        if ranked.len() < limit {
+            ranked.push(candidate);
+        } else if let Some(worst) = ranked.peek()
+            && candidate.is_better_than(worst)
+        {
+            ranked.pop();
+            ranked.push(candidate);
+        }
     }
+    let mut ranked = ranked.into_vec();
     ranked.sort_by(|a, b| {
         let order = match vector_type.metric {
-            DistanceMetric::DotProduct => b.0.partial_cmp(&a.0),
-            DistanceMetric::Cosine | DistanceMetric::Euclidean => a.0.partial_cmp(&b.0),
+            DistanceMetric::DotProduct => b.score.partial_cmp(&a.score),
+            DistanceMetric::Cosine | DistanceMetric::Euclidean => a.score.partial_cmp(&b.score),
         }
         .unwrap_or(Ordering::Equal);
-        order.then_with(|| a.1.id.cmp(&b.1.id))
+        order.then_with(|| a.row.id.cmp(&b.row.id))
     });
-    ranked.truncate(stmt.top.limit as usize);
     let columns = stmt
         .return_fields
         .iter()
@@ -477,15 +627,18 @@ fn find(db: &mut Database, stmt: &crate::dql::ast::Find) -> Result<QueryResult, 
         .collect::<Result<Vec<_>, _>>()?;
     let rows = ranked
         .into_iter()
-        .map(|(score, row)| crate::result::Row {
+        .map(|candidate| crate::result::Row {
             values: stmt
                 .return_fields
                 .iter()
                 .map(|field| match field {
-                    ReturnField::Field(name) => {
-                        row.values.get(name).cloned().unwrap_or(Value::Null)
-                    }
-                    ReturnField::Score => Value::Number(score.to_string()),
+                    ReturnField::Field(name) => collection
+                        .schema()
+                        .get_field(name)
+                        .and_then(|field| candidate.row.get(field))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    ReturnField::Score => Value::Number(candidate.score.to_string()),
                 })
                 .collect(),
         })
@@ -528,7 +681,7 @@ fn get(db: &mut Database, stmt: &crate::dql::ast::Get) -> Result<QueryResult, Da
         .filter(|row| db.is_live_record(&stmt.collection, row.id))
     {
         if let Some(filter) = &stmt.filter
-            && !matches_filter(filter, &row.values)?
+            && !matches_filter(filter, row, collection.schema())?
         {
             continue;
         }
@@ -537,9 +690,12 @@ fn get(db: &mut Database, stmt: &crate::dql::ast::Get) -> Result<QueryResult, Da
                 .return_fields
                 .iter()
                 .map(|field| match field {
-                    ReturnField::Field(name) => {
-                        row.values.get(name).cloned().unwrap_or(Value::Null)
-                    }
+                    ReturnField::Field(name) => collection
+                        .schema()
+                        .get_field(name)
+                        .and_then(|field| row.get(field))
+                        .cloned()
+                        .unwrap_or(Value::Null),
                     ReturnField::Score => Value::Null,
                 })
                 .collect(),
@@ -607,7 +763,7 @@ fn check_collection(
             continue;
         }
         for field in collection.schema().fields() {
-            match row.values.get(&field.name) {
+            match row.get(field) {
                 Some(value) => {
                     if let Err(error) = validate_value(field, value) {
                         issues.push(diagnostic_row(
@@ -629,22 +785,12 @@ fn check_collection(
                 None => {}
             }
         }
-        for field_name in row.values.keys() {
-            if !collection.schema().has_field(field_name) {
-                issues.push(diagnostic_row(
-                    &scope,
-                    "error",
-                    "unknown_field",
-                    format!("row {} contains unknown field '{}'", row.id, field_name),
-                ));
-            }
-        }
         if let Some(primary) = collection
             .schema()
             .fields()
             .iter()
             .find(|field| field.primary_key)
-            && let Some(value) = row.values.get(&primary.name)
+            && let Some(value) = row.get(primary)
         {
             if primary_values.iter().any(|existing| existing == value) {
                 issues.push(diagnostic_row(
@@ -723,6 +869,7 @@ fn check_database(db: &mut Database) -> Result<QueryResult, DatabaseError> {
             crate::engine::SCHEMA_DATA_TYPE
                 | crate::engine::TABLE_DATA_TYPE
                 | crate::engine::VECTOR_DATA_TYPE
+                | crate::engine::INDEX_DATA_TYPE
         ) {
             issues.push(diagnostic_row(
                 scope,
@@ -858,8 +1005,7 @@ fn stats_collection(
                 .filter_map(move |field| {
                     matches!(field.data_type, DataType::Vector(_))
                         .then(|| {
-                            row.values
-                                .get(&field.name)
+                            row.get(field)
                                 .filter(|value| matches!(value, Value::Vector(_)))
                         })
                         .flatten()
@@ -1042,6 +1188,7 @@ fn segment_type_name(data_type: u8) -> &'static str {
         crate::engine::SCHEMA_DATA_TYPE => "schema",
         crate::engine::TABLE_DATA_TYPE => "table",
         crate::engine::VECTOR_DATA_TYPE => "vector",
+        crate::engine::INDEX_DATA_TYPE => "index",
         _ => "unknown",
     }
 }
@@ -1111,16 +1258,24 @@ fn validate_value(field: &Field, value: &Value) -> Result<(), DatabaseError> {
 
 fn matches_filter(
     filter: &FilterExpr,
-    values: &HashMap<String, Value>,
+    row: &crate::engine::StoredRow,
+    schema: &Schema,
 ) -> Result<bool, DatabaseError> {
     match filter {
-        FilterExpr::And(a, b) => Ok(matches_filter(a, values)? && matches_filter(b, values)?),
-        FilterExpr::Or(a, b) => Ok(matches_filter(a, values)? || matches_filter(b, values)?),
+        FilterExpr::And(a, b) => {
+            Ok(matches_filter(a, row, schema)? && matches_filter(b, row, schema)?)
+        }
+        FilterExpr::Or(a, b) => {
+            Ok(matches_filter(a, row, schema)? || matches_filter(b, row, schema)?)
+        }
         FilterExpr::Comparison {
             field,
             operator,
             value,
-        } => compare(values.get(field), operator, value),
+        } => {
+            let left = schema.get_field(field).and_then(|field| row.get(field));
+            compare(left, operator, value)
+        }
     }
 }
 
@@ -1162,29 +1317,36 @@ fn compare(
     })
 }
 
-fn cosine(a: &[f64], b: &[f64]) -> f64 {
+fn cosine(a: &[f64], b: &[f32]) -> f64 {
     let dot = raw_dot_product(a, b);
     let na = a.iter().map(|v| v * v).sum::<f64>().sqrt();
-    let nb = b.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let nb = b
+        .iter()
+        .map(|v| f64::from(*v) * f64::from(*v))
+        .sum::<f64>()
+        .sqrt();
     if na == 0.0 || nb == 0.0 {
         1.0
     } else {
         1.0 - dot / (na * nb)
     }
 }
-fn euclidean(a: &[f64], b: &[f64]) -> f64 {
+fn euclidean(a: &[f64], b: &[f32]) -> f64 {
     a.iter()
         .zip(b)
-        .map(|(x, y)| (x - y) * (x - y))
+        .map(|(x, y)| {
+            let y = f64::from(*y);
+            (x - y) * (x - y)
+        })
         .sum::<f64>()
         .sqrt()
 }
-fn dot_product(a: &[f64], b: &[f64]) -> f64 {
+fn dot_product(a: &[f64], b: &[f32]) -> f64 {
     raw_dot_product(a, b)
 }
 
-fn raw_dot_product(a: &[f64], b: &[f64]) -> f64 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
+fn raw_dot_product(a: &[f64], b: &[f32]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| x * f64::from(*y)).sum()
 }
 
 fn validate_filter_fields(

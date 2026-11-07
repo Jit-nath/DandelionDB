@@ -23,6 +23,8 @@ const SEGMENT_RECORD_HEADER_SIZE: u64 = 12;
 const TABLE_UPSERT: u8 = 0x21;
 const VECTOR_UPSERT: u8 = 0x22;
 const TOMBSTONE: u8 = 0x23;
+const TABLE_DATA_TYPE: u8 = 0x01;
+const VECTOR_DATA_TYPE: u8 = 0x02;
 
 #[derive(Debug, Clone)]
 pub enum LogicalRecord {
@@ -116,38 +118,84 @@ impl SegmentReader {
         Ok(bytes)
     }
 
-    /// Traverses only unreserved regions, returning the payload of each data
-    /// record in physical write order.
+    /// Traverses log segments, returning the payload of each data record in
+    /// physical write order.
     pub fn read_data_records(
         &self,
         file: &mut File,
-        index: &SegmentIndex,
+        _index: &SegmentIndex,
     ) -> io::Result<Vec<Vec<u8>>> {
-        let mut cursor = HEADER_SIZE + index.size();
         let mut records = Vec::new();
-        while cursor < self.file_size {
-            if let Some(entry) = self.segment_at(cursor) {
-                cursor = entry.offset + entry.total_size;
-                continue;
+        for entry in self
+            .entries
+            .iter()
+            .filter(|entry| entry.data_type() == 0xff)
+        {
+            let used = self
+                .segment_used(file, entry)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid log segment"))?;
+            let mut cursor = entry.offset + SEGMENT_HEADER_SIZE;
+            let end = entry.offset + used;
+            while cursor < end {
+                if cursor + SEGMENT_RECORD_HEADER_SIZE > end {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "truncated log record header",
+                    ));
+                }
+                let header = self.read_range(file, cursor, SEGMENT_RECORD_HEADER_SIZE as usize)?;
+                if &header[..8] != DATA_RECORD_MAGIC {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid log record magic",
+                    ));
+                }
+                let length = u32::from_le_bytes(header[8..12].try_into().unwrap()) as u64;
+                let payload_offset = cursor + SEGMENT_RECORD_HEADER_SIZE;
+                let payload = self.read_range(
+                    file,
+                    payload_offset,
+                    usize::try_from(length).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidData, "log record is too large")
+                    })?,
+                )?;
+                records.push(payload);
+                cursor = payload_offset
+                    .checked_add(length)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "log overflow"))?;
             }
-            if cursor + 12 > self.file_size {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "truncated data record header",
-                ));
+        }
+        Ok(records)
+    }
+
+    pub fn read_segment_records(
+        &self,
+        file: &mut File,
+        entry: &SegmentIndexEntry,
+    ) -> Result<Vec<Vec<u8>>, DatabaseError> {
+        let used = self.segment_used(file, entry)?;
+        let mut cursor = entry.offset + SEGMENT_HEADER_SIZE;
+        let end = entry.offset + used;
+        let mut records = Vec::new();
+        while cursor < end {
+            if cursor + SEGMENT_RECORD_HEADER_SIZE > end {
+                return Err(DatabaseError::InvalidDatabase);
             }
-            let header = self.read_range(file, cursor, 12)?;
+            let header = self.read_range(file, cursor, SEGMENT_RECORD_HEADER_SIZE as usize)?;
             if &header[..8] != DATA_RECORD_MAGIC {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unknown data between segments",
-                ));
+                return Err(DatabaseError::InvalidDatabase);
             }
-            let length = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
-            let payload_offset = cursor + 12;
-            let payload = self.read_range(file, payload_offset, length)?;
-            cursor = payload_offset + u64::try_from(length).unwrap();
+            let length = u32::from_le_bytes(header[8..12].try_into().unwrap()) as u64;
+            let payload_offset = cursor + SEGMENT_RECORD_HEADER_SIZE;
+            let payload = self.read_range(
+                file,
+                payload_offset,
+                usize::try_from(length).map_err(|_| DatabaseError::InvalidDatabase)?,
+            )?;
             records.push(payload);
+            cursor = payload_offset
+                .checked_add(length)
+                .ok_or(DatabaseError::InvalidDatabase)?;
         }
         Ok(records)
     }
@@ -161,7 +209,11 @@ impl SegmentReader {
         committed: &HashSet<u64>,
     ) -> Result<Vec<LogicalRecord>, DatabaseError> {
         let mut records = Vec::new();
-        for entry in self.entries.iter().filter(|entry| entry.data_type() != 0) {
+        for entry in self
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.data_type(), TABLE_DATA_TYPE | VECTOR_DATA_TYPE))
+        {
             let used = self.segment_used(file, entry)?;
             let mut cursor = entry.offset + SEGMENT_HEADER_SIZE;
             let end = entry.offset + used;
@@ -187,9 +239,8 @@ impl SegmentReader {
                         .try_into()
                         .map_err(|_| DatabaseError::InvalidDatabase)?,
                 );
-                if committed.contains(&transaction_id) {
-                    records.push(decode_logical_record(&payload)?);
-                }
+                let _ = committed;
+                records.push(decode_logical_record(&payload)?);
                 cursor = payload_offset
                     .checked_add(length)
                     .ok_or(DatabaseError::InvalidDatabase)?;
@@ -216,13 +267,6 @@ impl SegmentReader {
             return Err(DatabaseError::InvalidDatabase);
         }
         Ok(used)
-    }
-
-    fn segment_at(&self, offset: u64) -> Option<&SegmentIndexEntry> {
-        let position = self.entries.partition_point(|entry| entry.offset <= offset);
-        self.entries
-            .get(position.checked_sub(1)?)
-            .filter(|entry| offset < entry.offset.saturating_add(entry.total_size))
     }
 }
 

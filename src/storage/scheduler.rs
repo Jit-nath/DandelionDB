@@ -96,6 +96,7 @@ impl StorageScheduler {
         reservations
     }
 
+    /// Reserves the database-wide mutation-log stream.
     /// Returns the standard size for a new extent belonging to a collection
     /// data stream. Rollover uses the same plan as initial allocation so the
     /// storage layer can grow without callers managing physical segments.

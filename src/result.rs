@@ -33,10 +33,7 @@ pub struct Row {
 }
 
 impl std::fmt::Display for QueryResult {
-    fn fmt(
-        &self,
-        f: &mut std::fmt::Formatter<'_>,
-    ) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             QueryResult::Empty => {
                 write!(f, "Empty result")
@@ -61,16 +58,13 @@ impl std::fmt::Display for QueryResult {
                 }
 
                 // Calculate column widths
-                let mut widths: Vec<usize> = columns
-                    .iter()
-                    .map(|column| column.name.len())
-                    .collect();
+                let mut widths: Vec<usize> =
+                    columns.iter().map(|column| column.name.len()).collect();
 
                 for row in rows {
                     for (index, value) in row.values.iter().enumerate() {
                         if index < widths.len() {
-                            widths[index] =
-                                widths[index].max(format!("{:?}", value).len());
+                            widths[index] = widths[index].max(format!("{:?}", value).len());
                         }
                     }
                 }
