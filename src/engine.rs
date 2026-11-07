@@ -314,15 +314,39 @@ impl Database {
     where
         I: IntoIterator<Item = InsertRow>,
     {
-        const CHUNK_SIZE: usize = 256;
+        self.bulk_insert_with_chunk_size(collection, rows, 256)
+    }
+
+    /// Inserts rows in caller-selected bounded chunks and rebuilds vector
+    /// indexes once at the end.
+    ///
+    /// Larger chunks reduce transaction and durability overhead, but increase
+    /// temporary memory usage. This operation is intentionally streaming and
+    /// may have committed earlier chunks if a later chunk fails validation.
+    /// `chunk_size` must be greater than zero.
+    pub fn bulk_insert_with_chunk_size<I>(
+        &mut self,
+        collection: impl AsRef<str>,
+        rows: I,
+        chunk_size: usize,
+    ) -> Result<crate::result::QueryResult, DatabaseError>
+    where
+        I: IntoIterator<Item = InsertRow>,
+    {
+        if chunk_size == 0 {
+            return Err(DatabaseError::Validation(
+                "Bulk insert chunk size must be greater than zero".into(),
+            ));
+        }
+
         let collection = collection.as_ref();
-        let mut chunk = Vec::with_capacity(CHUNK_SIZE);
+        let mut chunk = Vec::with_capacity(chunk_size);
         let mut affected = 0u64;
         let mut last_insert_id = None;
 
         for row in rows {
             chunk.push(row.values);
-            if chunk.len() == CHUNK_SIZE {
+            if chunk.len() == chunk_size {
                 if let crate::result::QueryResult::Affected {
                     rows_affected,
                     last_insert_id: last,
@@ -2086,6 +2110,42 @@ mod tests {
             ));
         }
 
+        db.close().expect("database should close");
+        std::fs::remove_file(path).expect("test database should be removed");
+    }
+
+    #[test]
+    fn configurable_bulk_insert_rejects_zero_and_uses_requested_limit() {
+        let path = test_path("bulk-chunk-size");
+        let _ = std::fs::remove_file(&path);
+        let mut db = Database::create(&path).expect("database should be created");
+        db.execute(
+            r#"create collection "docs" {
+                "id" uint64 primary auto_increment,
+                "body" text,
+            };"#,
+        )
+        .expect("collection should be created");
+
+        let error = db
+            .bulk_insert_with_chunk_size("docs", Vec::<InsertRow>::new(), 0)
+            .expect_err("zero chunk size should fail");
+        assert!(matches!(error, crate::errors::DatabaseError::Validation(_)));
+
+        let rows = (0..5)
+            .map(|index| InsertRow::new().text("body", format!("row-{index}")))
+            .collect::<Vec<_>>();
+        let result = db
+            .bulk_insert_with_chunk_size("docs", rows, 2)
+            .expect("configured bulk insert should work");
+        assert!(matches!(
+            result,
+            QueryResult::Affected {
+                rows_affected: 5,
+                last_insert_id: Some(crate::dql::ast::Value::Number(ref id)),
+            } if id == "5"
+        ));
+        assert_eq!(db.live_record_count("docs"), 5);
         db.close().expect("database should close");
         std::fs::remove_file(path).expect("test database should be removed");
     }
