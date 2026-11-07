@@ -68,7 +68,7 @@ pub struct Database {
 }
 
 impl Database {
-    /// Creates a new LionDB database at the specified path.
+    /// Creates a new DandelionDB database at the specified path.
     ///
     /// The parent directory must exist, and the target file must not already exist.
     ///
@@ -156,7 +156,7 @@ impl Database {
         })
     }
 
-    /// Opens an existing dandelionDB database.
+    /// Opens an existing DandelionDB database.
     ///
     /// The file must have a `.lion` extension and a valid database structure.
     ///
