@@ -145,6 +145,15 @@ pub(crate) fn insert_rows(
     collection_name: &str,
     rows_to_insert: &[Vec<FieldValue>],
 ) -> Result<QueryResult, DatabaseError> {
+    insert_rows_with_index_policy(db, collection_name, rows_to_insert, true)
+}
+
+pub(crate) fn insert_rows_with_index_policy(
+    db: &mut Database,
+    collection_name: &str,
+    rows_to_insert: &[Vec<FieldValue>],
+    rebuild_indexes: bool,
+) -> Result<QueryResult, DatabaseError> {
     if rows_to_insert.is_empty() {
         return Err(DatabaseError::Validation(
             "Insert must contain at least one row".into(),
@@ -257,7 +266,9 @@ pub(crate) fn insert_rows(
     db.append_row_insert_batch(collection_name, &prepared)?;
     db.next_row_id = db.next_row_id.max(next_row_id);
     db.rows_mut(collection_name).extend(prepared);
-    db.rebuild_vector_indexes()?;
+    if rebuild_indexes {
+        db.rebuild_vector_indexes()?;
+    }
     Ok(QueryResult::Affected {
         rows_affected: rows_to_insert.len() as u64,
         last_insert_id,
@@ -368,25 +379,20 @@ fn find(db: &mut Database, stmt: &crate::dql::ast::Find) -> Result<QueryResult, 
     if let Some(filter) = &stmt.filter {
         validate_filter_fields(filter, &collection)?;
     }
-    let query = match &stmt.vector {
-        VectorExpr::Literal(values) => values
-            .iter()
-            .map(|v| {
-                v.parse::<f64>()
-                    .map_err(|_| DatabaseError::Validation("Invalid query vector".into()))
-            })
-            .collect::<Result<Vec<_>, _>>()?,
+    let query_f32: Vec<f32> = match &stmt.vector {
+        VectorExpr::Literal(values) => values.clone(),
         VectorExpr::Variable(_) => {
             return Err(DatabaseError::Validation(
                 "Vector variables require a bound execution environment".into(),
             ));
         }
     };
-    if query.len() != vector_type.dimension as usize {
+    if query_f32.len() != vector_type.dimension as usize {
         return Err(DatabaseError::Validation(
             "Query vector dimension does not match field".into(),
         ));
     }
+    let query: Vec<f64> = query_f32.iter().map(|v| f64::from(*v)).collect();
     let search_budget = stmt
         .search
         .as_ref()
@@ -395,7 +401,7 @@ fn find(db: &mut Database, stmt: &crate::dql::ast::Find) -> Result<QueryResult, 
     let candidate_ids = db
         .indexes
         .get(&(stmt.collection.clone(), stmt.column.clone()))
-        .and_then(|index| index.candidates(&query, stmt.top.limit as usize, search_budget));
+        .and_then(|index| index.candidates(&query_f32, stmt.top.limit as usize, search_budget));
     let mut ranked = Vec::new();
     for row in db
         .rows(&stmt.collection)
@@ -419,7 +425,7 @@ fn find(db: &mut Database, stmt: &crate::dql::ast::Find) -> Result<QueryResult, 
         if value.len() != query.len() {
             continue;
         }
-        let numbers: Vec<f64> = value.iter().filter_map(|v| v.parse().ok()).collect();
+        let numbers: Vec<f64> = value.as_slice().iter().map(|v| f64::from(*v)).collect();
         if numbers.len() != query.len() {
             continue;
         }
@@ -1084,11 +1090,9 @@ fn validate_value(field: &Field, value: &Value) -> Result<(), DatabaseError> {
             if values.len() == vector.dimension as usize =>
         {
             let mut norm_squared = 0.0;
-            for value in values {
-                validate_vector_element(vector.element_type, value)?;
-                let number = value
-                    .parse::<f64>()
-                    .map_err(|_| DatabaseError::Validation("Invalid vector value".into()))?;
+            for value in values.as_slice() {
+                validate_vector_element(vector.element_type, *value)?;
+                let number = f64::from(*value);
                 norm_squared += number * number;
             }
             if matches!(vector.metric, DistanceMetric::Cosine) && norm_squared == 0.0 {
@@ -1245,40 +1249,52 @@ fn validate_numeric(
 
 fn validate_vector_element(
     element_type: VectorElementType,
-    value: &str,
+    value: f32,
 ) -> Result<(), DatabaseError> {
     let invalid = || DatabaseError::Validation("Invalid vector element value".into());
     match element_type {
-        VectorElementType::Binary => match value {
-            "0" | "1" => Ok(()),
-            _ => Err(invalid()),
-        },
-        VectorElementType::Int4 => value
-            .parse::<i8>()
-            .ok()
-            .filter(|value| (-8..=7).contains(value))
-            .map(|_| ())
-            .ok_or_else(invalid),
-        VectorElementType::Int8 => value.parse::<i8>().map(|_| ()).map_err(|_| invalid()),
-        VectorElementType::Int16 => value.parse::<i16>().map(|_| ()).map_err(|_| invalid()),
-        VectorElementType::FP16 => value
-            .parse::<f32>()
-            .ok()
-            .filter(|value| value.is_finite() && value.abs() <= 65_504.0)
-            .map(|_| ())
-            .ok_or_else(invalid),
-        VectorElementType::FP32 => value
-            .parse::<f32>()
-            .ok()
-            .filter(|value| value.is_finite())
-            .map(|_| ())
-            .ok_or_else(invalid),
-        VectorElementType::FP64 => value
-            .parse::<f64>()
-            .ok()
-            .filter(|value| value.is_finite())
-            .map(|_| ())
-            .ok_or_else(invalid),
+        VectorElementType::Binary => {
+            if value == 0.0 || value == 1.0 {
+                Ok(())
+            } else {
+                Err(invalid())
+            }
+        }
+        VectorElementType::Int4 => {
+            if value.is_finite() && value.fract() == 0.0 && (-8.0..=7.0).contains(&value) {
+                Ok(())
+            } else {
+                Err(invalid())
+            }
+        }
+        VectorElementType::Int8 => {
+            if value.is_finite() && value.fract() == 0.0 && (-128.0..=127.0).contains(&value) {
+                Ok(())
+            } else {
+                Err(invalid())
+            }
+        }
+        VectorElementType::Int16 => {
+            if value.is_finite() && value.fract() == 0.0 && (-32768.0..=32767.0).contains(&value) {
+                Ok(())
+            } else {
+                Err(invalid())
+            }
+        }
+        VectorElementType::FP16 => {
+            if value.is_finite() && value.abs() <= 65_504.0 {
+                Ok(())
+            } else {
+                Err(invalid())
+            }
+        }
+        VectorElementType::FP32 | VectorElementType::FP64 => {
+            if value.is_finite() {
+                Ok(())
+            } else {
+                Err(invalid())
+            }
+        }
     }
 }
 

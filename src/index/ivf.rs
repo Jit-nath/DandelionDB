@@ -8,13 +8,13 @@ use crate::types::DistanceMetric;
 
 #[derive(Debug, Clone)]
 pub(crate) struct IvfIndex {
-    centroids: Vec<Vec<f64>>,
-    lists: Vec<Vec<(u64, Vec<f64>)>>,
+    centroids: Vec<Vec<f32>>,
+    lists: Vec<Vec<(u64, Vec<f32>)>>,
     metric: DistanceMetric,
 }
 
 impl IvfIndex {
-    pub(crate) fn build(points: &[(u64, Vec<f64>)], metric: DistanceMetric, nlist: usize) -> Self {
+    pub(crate) fn build(points: &[(u64, Vec<f32>)], metric: DistanceMetric, nlist: usize) -> Self {
         if points.is_empty() {
             return Self {
                 centroids: Vec::new(),
@@ -51,7 +51,7 @@ impl IvfIndex {
         (16, 200, self.centroids.len().max(1))
     }
 
-    pub(crate) fn search(&self, query: &[f64], limit: usize, nprobe: usize) -> Vec<u64> {
+    pub(crate) fn search(&self, query: &[f32], limit: usize, nprobe: usize) -> Vec<u64> {
         if self.centroids.is_empty() {
             return Vec::new();
         }

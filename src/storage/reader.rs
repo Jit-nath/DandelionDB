@@ -299,9 +299,24 @@ fn decode_value(bytes: &[u8], cursor: &mut usize) -> Result<Value, DatabaseError
                 u32::from_le_bytes(take_bytes(bytes, cursor, 4)?.try_into().unwrap()) as usize;
             let mut values = Vec::with_capacity(len);
             for _ in 0..len {
-                values.push(decode_string(bytes, cursor)?);
+                values.push(
+                    decode_string(bytes, cursor)?
+                        .parse::<f32>()
+                        .map_err(|_| DatabaseError::InvalidDatabase)?,
+                );
             }
-            Value::Vector(values)
+            Value::Vector(crate::types::PackedVector::new(values.into_boxed_slice()))
+        }
+        6 => {
+            let len =
+                u32::from_le_bytes(take_bytes(bytes, cursor, 4)?.try_into().unwrap()) as usize;
+            let mut values = Vec::with_capacity(len);
+            for _ in 0..len {
+                values.push(f32::from_le_bytes(
+                    take_bytes(bytes, cursor, 4)?.try_into().unwrap(),
+                ));
+            }
+            Value::Vector(crate::types::PackedVector::new(values.into_boxed_slice()))
         }
         _ => return Err(DatabaseError::InvalidDatabase),
     })

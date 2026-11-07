@@ -85,7 +85,7 @@ impl InsertRow {
         self.value(field, Value::Null)
     }
 
-    /// Adds a vector and converts each element with [`ToString`].
+    /// Adds a vector and packs each element as `f32`.
     pub fn vector<I, T>(self, field: impl Into<String>, values: I) -> Self
     where
         I: IntoIterator<Item = T>,
@@ -93,7 +93,18 @@ impl InsertRow {
     {
         self.value(
             field,
-            Value::Vector(values.into_iter().map(|value| value.to_string()).collect()),
+            Value::Vector(crate::types::PackedVector::new(
+                values
+                    .into_iter()
+                    .map(|value| {
+                        value
+                            .to_string()
+                            .parse::<f32>()
+                            .expect("invalid vector value")
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            )),
         )
     }
 }
@@ -120,7 +131,6 @@ pub struct Database {
 }
 
 impl Database {
-
     /// Creates a new LionDB database at the specified path.
     ///
     /// The parent directory must exist, and the target file must not already exist.
@@ -138,9 +148,7 @@ impl Database {
             return Err(DatabaseError::InvalidDatabasePath);
         }
 
-        let parent = path
-            .parent()
-            .ok_or(DatabaseError::InvalidDatabasePath)?;
+        let parent = path.parent().ok_or(DatabaseError::InvalidDatabasePath)?;
 
         if !parent.exists() {
             return Err(DatabaseError::ParentDirectoryNotFound);
@@ -294,6 +302,57 @@ impl Database {
         crate::execution::execute::insert_rows(self, collection.as_ref(), &rows)
     }
 
+    /// Inserts rows in bounded chunks and rebuilds vector indexes once at the end.
+    ///
+    /// Unlike `insert_many`, this streaming API may have already committed
+    /// earlier chunks if a later chunk fails validation.
+    pub fn bulk_insert<I>(
+        &mut self,
+        collection: impl AsRef<str>,
+        rows: I,
+    ) -> Result<crate::result::QueryResult, DatabaseError>
+    where
+        I: IntoIterator<Item = InsertRow>,
+    {
+        const CHUNK_SIZE: usize = 256;
+        let collection = collection.as_ref();
+        let mut chunk = Vec::with_capacity(CHUNK_SIZE);
+        let mut affected = 0u64;
+        let mut last_insert_id = None;
+
+        for row in rows {
+            chunk.push(row.values);
+            if chunk.len() == CHUNK_SIZE {
+                if let crate::result::QueryResult::Affected {
+                    rows_affected,
+                    last_insert_id: last,
+                } = crate::execution::execute::insert_rows_with_index_policy(
+                    self, collection, &chunk, false,
+                )? {
+                    affected += rows_affected;
+                    last_insert_id = last;
+                }
+                chunk.clear();
+            }
+        }
+        if !chunk.is_empty() {
+            if let crate::result::QueryResult::Affected {
+                rows_affected,
+                last_insert_id: last,
+            } = crate::execution::execute::insert_rows_with_index_policy(
+                self, collection, &chunk, false,
+            )? {
+                affected += rows_affected;
+                last_insert_id = last;
+            }
+        }
+        self.rebuild_vector_indexes()?;
+        Ok(crate::result::QueryResult::Affected {
+            rows_affected: affected,
+            last_insert_id,
+        })
+    }
+
     pub(crate) fn rebuild_vector_indexes(&mut self) -> Result<(), DatabaseError> {
         let definitions = self
             .indexes
@@ -348,21 +407,17 @@ impl Database {
                 ));
             }
         };
-        let points = self
+        let points: Vec<(u64, Vec<f32>)> = self
             .rows(collection)
             .iter()
             .filter(|row| !row.deleted)
             .filter_map(|row| match row.values.get(field) {
-                Some(Value::Vector(values)) => Some((
-                    row.id,
-                    values
-                        .iter()
-                        .filter_map(|value| value.parse().ok())
-                        .collect(),
-                )),
+                Some(Value::Vector(values)) => {
+                    Some((row.id, values.as_slice().iter().copied().collect()))
+                }
                 _ => None,
             })
-            .filter(|(_, values): &(u64, Vec<f64>)| values.len() == vector_type.dimension as usize)
+            .filter(|(_, values): &(u64, Vec<f32>)| values.len() == vector_type.dimension as usize)
             .collect::<Vec<_>>();
         let index =
             VectorIndex::build(kind, &points, vector_type.metric, m, ef_construction, nlist)
@@ -465,6 +520,11 @@ impl Database {
 
     pub(crate) fn append_data_record(&mut self, payload: &[u8]) -> Result<(), DatabaseError> {
         self.mutations.append(&mut self.file, payload)?;
+        Ok(())
+    }
+
+    fn append_data_record_unsynced(&mut self, payload: &[u8]) -> Result<(), DatabaseError> {
+        self.mutations.append_unsynced(&mut self.file, payload)?;
         Ok(())
     }
 
@@ -600,7 +660,7 @@ impl Database {
         let mut payload = vec![operation];
         payload.extend_from_slice(&transaction_id.to_le_bytes());
         payload.extend_from_slice(&0u32.to_le_bytes());
-        self.append_data_record(&payload)
+        self.append_data_record_unsynced(&payload)
     }
 
     fn append_segment_record(
@@ -1434,10 +1494,10 @@ fn encode_value(bytes: &mut Vec<u8>, value: &Value) -> Result<(), DatabaseError>
             encode_string(bytes, value)?;
         }
         Value::Vector(values) => {
-            bytes.push(5);
+            bytes.push(6);
             bytes.extend_from_slice(&(values.len() as u32).to_le_bytes());
-            for value in values {
-                encode_string(bytes, value)?;
+            for value in values.as_slice() {
+                bytes.extend_from_slice(&value.to_le_bytes());
             }
         }
     }
@@ -1457,9 +1517,24 @@ fn decode_value(bytes: &[u8], cursor: &mut usize) -> Result<Value, DatabaseError
                 u32::from_le_bytes(take_bytes(bytes, cursor, 4)?.try_into().unwrap()) as usize;
             let mut values = Vec::with_capacity(len);
             for _ in 0..len {
-                values.push(decode_string(bytes, cursor)?);
+                values.push(
+                    decode_string(bytes, cursor)?
+                        .parse::<f32>()
+                        .map_err(|_| DatabaseError::InvalidDatabase)?,
+                );
             }
-            Value::Vector(values)
+            Value::Vector(crate::types::PackedVector::new(values.into_boxed_slice()))
+        }
+        6 => {
+            let len =
+                u32::from_le_bytes(take_bytes(bytes, cursor, 4)?.try_into().unwrap()) as usize;
+            let mut values = Vec::with_capacity(len);
+            for _ in 0..len {
+                values.push(f32::from_le_bytes(
+                    take_bytes(bytes, cursor, 4)?.try_into().unwrap(),
+                ));
+            }
+            Value::Vector(crate::types::PackedVector::new(values.into_boxed_slice()))
         }
         _ => return Err(DatabaseError::InvalidDatabase),
     })

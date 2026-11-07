@@ -96,7 +96,11 @@ impl Parser {
         loop {
             match self.current() {
                 Token::Number(value) => {
-                    values.push(value.clone());
+                    values.push(
+                        value
+                            .parse::<f32>()
+                            .map_err(|_| "Invalid vector value".to_string())?,
+                    );
                     self.advance();
                 }
                 Token::RBracket => {
@@ -118,7 +122,9 @@ impl Parser {
             }
         }
 
-        Ok(Value::Vector(values))
+        Ok(Value::Vector(crate::types::PackedVector::new(
+            values.into_boxed_slice(),
+        )))
     }
 
     pub fn parse(&mut self) -> Result<Statement, String> {
@@ -676,7 +682,11 @@ impl Parser {
                 loop {
                     match self.current() {
                         Token::Number(value) => {
-                            values.push(value.clone());
+                            values.push(
+                                value
+                                    .parse::<f32>()
+                                    .map_err(|_| "Invalid vector value".to_string())?,
+                            );
                             self.advance();
                         }
 

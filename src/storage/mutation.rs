@@ -19,13 +19,17 @@ impl DataMutationProcess {
     /// Appends one fully encoded operation. It deliberately does not attempt
     /// to reuse free space left by deleted records.
     pub fn append(&self, file: &mut File, payload: &[u8]) -> io::Result<()> {
+        self.append_unsynced(file, payload)?;
+        file.sync_all()
+    }
+
+    pub fn append_unsynced(&self, file: &mut File, payload: &[u8]) -> io::Result<()> {
         let length = u32::try_from(payload.len())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "data record is too large"))?;
         file.seek(SeekFrom::End(0))?;
         file.write_all(DATA_RECORD_MAGIC)?;
         file.write_all(&length.to_le_bytes())?;
-        file.write_all(payload)?;
-        file.sync_all()
+        file.write_all(payload)
     }
 
     pub fn record_insert(&mut self, collection: &str, id: u64) {

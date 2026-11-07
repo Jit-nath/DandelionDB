@@ -21,4 +21,6 @@ pub use dql::ast::Value;
 pub use engine::{Database, InsertRow};
 pub use errors::DatabaseError;
 pub use result::{Column, QueryResult, Row};
-pub use types::{DataType, DistanceMetric, ScalarType, VectorElementType, VectorType};
+pub use types::{
+    DataType, DistanceMetric, PackedVector, ScalarType, VectorElementType, VectorType,
+};

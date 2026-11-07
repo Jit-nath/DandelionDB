@@ -159,7 +159,7 @@ pub struct SearchClause {
 
 #[derive(Debug)]
 pub enum VectorExpr {
-    Literal(Vec<String>),
+    Literal(Vec<f32>),
     Variable(String),
 }
 
@@ -180,7 +180,7 @@ pub enum Value {
     Number(String),
     Boolean(bool),
     Variable(String),
-    Vector(Vec<String>),
+    Vector(crate::types::PackedVector),
 }
 
 // =========================

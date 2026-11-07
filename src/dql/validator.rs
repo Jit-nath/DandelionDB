@@ -381,10 +381,7 @@ fn validate_find(stmt: &Find) -> Result<(), String> {
         }
         VectorExpr::Literal(values) => {
             for value in values {
-                let number = value
-                    .parse::<f64>()
-                    .map_err(|_| "Invalid query vector value".to_string())?;
-                if !number.is_finite() {
+                if !value.is_finite() {
                     return Err("Query vector values must be finite".to_string());
                 }
             }
@@ -476,13 +473,6 @@ fn validate_value(value: &Value) -> Result<(), String> {
             if values.is_empty() {
                 return Err("Vector cannot be empty".to_string());
             }
-
-            for value in values {
-                value
-                    .parse::<f64>()
-                    .map_err(|_| "Invalid vector value".to_string())?;
-            }
-
             Ok(())
         }
     }

@@ -8,7 +8,7 @@ use crate::types::DistanceMetric;
 
 #[derive(Debug, Clone)]
 pub(crate) struct HnswIndex {
-    points: Vec<(u64, Vec<f64>)>,
+    points: Vec<(u64, Vec<f32>)>,
     neighbors: Vec<Vec<usize>>,
     metric: DistanceMetric,
     m: usize,
@@ -17,7 +17,7 @@ pub(crate) struct HnswIndex {
 
 impl HnswIndex {
     pub(crate) fn build(
-        points: &[(u64, Vec<f64>)],
+        points: &[(u64, Vec<f32>)],
         metric: DistanceMetric,
         m: usize,
         _ef_construction: usize,
@@ -53,7 +53,7 @@ impl HnswIndex {
         (self.m, self.ef_construction, 16)
     }
 
-    pub(crate) fn search(&self, query: &[f64], limit: usize, ef: usize) -> Vec<u64> {
+    pub(crate) fn search(&self, query: &[f32], limit: usize, ef: usize) -> Vec<u64> {
         if self.points.is_empty() {
             return Vec::new();
         }

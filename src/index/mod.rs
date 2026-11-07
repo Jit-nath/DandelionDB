@@ -22,7 +22,7 @@ pub(crate) enum VectorIndex {
 impl VectorIndex {
     pub(crate) fn build(
         kind: &str,
-        points: &[(u64, Vec<f64>)],
+        points: &[(u64, Vec<f32>)],
         metric: DistanceMetric,
         m: usize,
         ef_construction: usize,
@@ -43,7 +43,7 @@ impl VectorIndex {
 
     pub(crate) fn candidates(
         &self,
-        query: &[f64],
+        query: &[f32],
         limit: usize,
         search_budget: usize,
     ) -> Option<Vec<u64>> {
@@ -71,12 +71,12 @@ impl VectorIndex {
     }
 }
 
-pub(crate) fn distance(metric: DistanceMetric, a: &[f64], b: &[f64]) -> f64 {
+pub(crate) fn distance(metric: DistanceMetric, a: &[f32], b: &[f32]) -> f32 {
     match metric {
         DistanceMetric::Cosine => {
-            let dot = a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>();
-            let an = a.iter().map(|x| x * x).sum::<f64>().sqrt();
-            let bn = b.iter().map(|x| x * x).sum::<f64>().sqrt();
+            let dot = a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+            let an = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let bn = b.iter().map(|x| x * x).sum::<f32>().sqrt();
             if an == 0.0 || bn == 0.0 {
                 1.0
             } else {
@@ -87,8 +87,8 @@ pub(crate) fn distance(metric: DistanceMetric, a: &[f64], b: &[f64]) -> f64 {
             .iter()
             .zip(b)
             .map(|(x, y)| (x - y) * (x - y))
-            .sum::<f64>()
+            .sum::<f32>()
             .sqrt(),
-        DistanceMetric::DotProduct => -a.iter().zip(b).map(|(x, y)| x * y).sum::<f64>(),
+        DistanceMetric::DotProduct => -a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>(),
     }
 }

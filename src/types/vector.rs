@@ -25,6 +25,32 @@ pub struct VectorType {
     pub metric: DistanceMetric,
 }
 
+/// Compact in-memory representation of a vector value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackedVector {
+    values: Box<[f32]>,
+}
+
+impl PackedVector {
+    pub fn new(values: impl Into<Box<[f32]>>) -> Self {
+        Self {
+            values: values.into(),
+        }
+    }
+
+    pub fn as_slice(&self) -> &[f32] {
+        &self.values
+    }
+
+    pub fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+}
+
 impl VectorType {
     pub fn new(element_type: VectorElementType, dimension: u32, metric: DistanceMetric) -> Self {
         Self {
