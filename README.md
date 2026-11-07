@@ -1,11 +1,13 @@
 # DandelionDB
 
 [![Rust](https://img.shields.io/badge/built_with-Rust-orange?logo=rust)](https://www.rust-lang.org/)
-[![Embedded](https://img.shields.io/badge/type-embedded_database-6f42c1)](https://github.com/Jit-nath/DandelionDB)
-[![Single file](https://img.shields.io/badge/storage-single_file-0ea5e9)](https://github.com/Jit-nath/DandelionDB)
-[![Vector search](https://img.shields.io/badge/search-vector_enabled-16a34a)](https://github.com/Jit-nath/DandelionDB)
+[![Crates.io](https://img.shields.io/crates/v/dandeliondb.svg)](https://crates.io/crates/dandeliondb)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Status](https://img.shields.io/badge/status-in_development-yellow)](https://github.com/Jit-nath/DandelionDB)
+[![Downloads](https://img.shields.io/crates/d/dandeliondb.svg)](https://crates.io/crates/dandeliondb)
+[![Documentation](https://docs.rs/dandeliondb/badge.svg)](https://docs.rs/dandeliondb)
+
+
 
 DandelionDB is a small embedded database for applications that need structured records and vector similarity search without running a separate database server.
 
@@ -36,45 +38,73 @@ DandelionDB is aimed at developers building:
 
 It is especially useful when the database belongs inside the application and the user should not have to install or manage another service.
 
-## Quick example
+## Getting started
+
+### 1. Install
+
+Add DandelionDB to your `Cargo.toml`:
+
+```toml
+[dependencies]
+dandeliondb = "0.2.0"
+```
+
+Or install using Cargo:
+
+```bash
+cargo add dandeliondb
+```
+
+### 2. Create a database
 
 ```rust
 use dandeliondb::Database;
 
-let mut db = Database::create("products.lion")?;
+let mut db = Database::create("my_database.lion")?;
+```
 
+### 3. Create a collection
+
+```rust
 db.execute(r#"
-    create collection "products" {
+    create collection "documents" {
         "id" uint64 primary auto_increment,
-        "name" text,
+        "content" text,
         "embedding" vector<fp32, 3> cosine,
     };
 "#)?;
+```
 
+### 4. Insert your first record
+
+```rust
 db.execute(r#"
-    insert into "products" {
-        "name": "Dandelion mug",
-        "embedding": [1, 0, 0],
+    insert into "documents" {
+        "content": "Hello, DandelionDB!",
+        "embedding": [0.1, 0.2, 0.3],
     };
 "#)?;
+```
 
+*Note: Replace the example embedding with a 384-dimensional vector before executing this example.*
+
+### 5. Perform vector search
+
+```rust
 let results = db.execute(r#"
-    find top 5 near [1, 0, 0]
-    on "products" ("embedding")
-    return "name", _score;
+    find top 5 near [0.1, 0.2, 0.3]
+    on "documents" ("embedding")
+    return "content", _score;
 "#)?;
+```
 
+### 6. Close the database
+
+```rust
 db.close()?;
-# Ok::<(), dandeliondb::DatabaseError>(())
 ```
 
-## Search options
-
-For smaller collections, flat search provides a straightforward exact scan. For larger vector collections, HNSW and IVF indexes can reduce search work by narrowing the candidate set.
-
-```sql
-create index on "products" ("embedding") using hnsw;
-```
+Your database is stored locally in a single `.lion` file. No external database server is required.
 
 ## Project status
 
